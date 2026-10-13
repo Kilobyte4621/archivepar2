@@ -1,5 +1,5 @@
-# Version Details: v0.14
-# Disposição do log refinada. 
+# Version Details: v0.15
+# Fix: Asynchronous BLAKE3 manifest generation synchronized without arbitrary sleep.
 archivepar2 () {
   local oldpwd="$PWD"
   local arch="$1"; shift
@@ -21,7 +21,7 @@ archivepar2 () {
     local current_arg="${1^^}"
     case "$current_arg" in
       --SINGLE) single_mode=1 ;;
-      --FAST)   fast_mode=1 ;;
+      --FAST)    fast_mode=1 ;;
       *)
         if [[ "$current_arg" =~ ^[1-9]+[0-9]*[KMGTP]$ ]]; then
           maxsize="$current_arg"
@@ -35,7 +35,7 @@ archivepar2 () {
   done
 
   cleanup() {
-    rm -f /tmp/zstd_err_$$ /tmp/par2_tty_$$ 2>/dev/null
+    rm -f /tmp/zstd_err_$$ /tmp/par2_tty_$$ /tmp/b3sum_status_$$ 2>/dev/null
     cd "$oldpwd" >/dev/null 2>&1
   }
   trap cleanup RETURN INT TERM
@@ -69,7 +69,7 @@ archivepar2 () {
 
   # Inicializa o arquivo de log de forma limpa
   echo "==================================================" > "$logfile"
-  echo "              ARCHIVEPAR2 SESSION LOG             " >> "$logfile"
+  echo "             ARCHIVEPAR2 SESSION LOG             " >> "$logfile"
   echo "==================================================" >> "$logfile"
   echo "Start Timestamp : $(date '+%Y-%m-%d %H:%M:%S')" >> "$logfile"
   echo "Source Path     : $arch" >> "$logfile"
@@ -160,7 +160,6 @@ archivepar2 () {
     stored=$(grep " ${out}.tar.zst$" "$manifest" | awk '{print $1}')
     [[ -z "$stored" ]] && stored=$(awk '!/^#/ {print $1; exit}' "$manifest")
 
-    # Resume Mode também ganha feedback visual de progresso aqui se usar arquivos grandes já existentes
     if command -v pv >/dev/null 2>&1; then
       current=$(cat "${parts[@]}" | pv -N "Validating Split Files" -p -t -e -r -b | b3sum | awk '{print $1}')
     else
@@ -211,7 +210,7 @@ archivepar2 () {
           rm -f "${out}.tar.zst.part-"* "${out}.par2"* "$manifest" "$logfile" 2>/dev/null
           update_parts_array
           echo "==================================================" > "$logfile"
-          echo "              ARCHIVEPAR2 SESSION LOG             " >> "$logfile"
+          echo "             ARCHIVEPAR2 SESSION LOG             " >> "$logfile"
           echo "==================================================" >> "$logfile"
         else
           print_log "Operation aborted by user. Existing files were preserved."
@@ -226,11 +225,24 @@ archivepar2 () {
 
       tar -cf - -C "$parent_dir" "$base" \
       | zstd -T0 -10 --long=27 -v --progress 2> >(tee /tmp/zstd_err_$$ >&2) \
-      | tee >(b3sum | awk -v f="${out}.tar.zst" '{print $1 "  " f}' >> "$manifest") \
+      | tee >(
+          set -o pipefail
+          b3sum | awk -v f="${out}.tar.zst" '{print $1 "  " f}' >> "$manifest"
+          echo $? > /tmp/b3sum_status_$$
+        ) \
       | split -d -a 3 -b "$maxsize" - "${out}.tar.zst.part-"
 
-      [[ $? -eq 0 ]] || { print_log "ERROR: archive pipeline failed"; return 1; }
-      sleep 0.5
+      local pipe_status=( "${PIPESTATUS[@]}" )
+      local pid_b3sum=$!
+
+      wait "$pid_b3sum"
+      local b3sum_exit=0
+      [[ -f /tmp/b3sum_status_$$ ]] && b3sum_exit=$(< /tmp/b3sum_status_$$)
+
+      [[ ${pipe_status[0]} -eq 0 && ${pipe_status[1]} -eq 0 && ${pipe_status[3]} -eq 0 && $b3sum_exit -eq 0 ]] || {
+        print_log "ERROR: archive pipeline or global hashing failed"
+        return 1
+      }
       [[ -s "$manifest" ]] || { print_log "ERROR: BLAKE3 manifest was not generated"; return 1; }
 
       zstd_golden_line=$(tr '\r' '\n' < /tmp/zstd_err_$$ | grep -E 'GiB|MiB|B =>' | tail -n1 | sed 's/^[ \t]*//')
@@ -246,7 +258,6 @@ archivepar2 () {
       update_parts_array
       [[ ${#parts[@]} -gt 0 ]] || { print_log "ERROR: no split parts found"; return 1; }
 
-      # Adicionado o 'pv' aqui para mostrar visualmente a leitura e o progresso de hash de cada pedaço gerado!
       if command -v pv >/dev/null 2>&1; then
         for part in "${parts[@]}"; do
           local p_size=$(stat -c%s "$part")
@@ -270,7 +281,6 @@ archivepar2 () {
     par2_start=$(date +%s)
     print_log "[PAR2] Creating recovery files..."
 
-    # Unifica os argumentos de forma segura em uma única variável antes de chamar o script
     local par2_cmd
     par2_cmd=$(printf "par2 create -r10 %q " "${out}.par2"; printf "%q " "${parts[@]}"; printf "%q" "$manifest")
     
@@ -313,7 +323,7 @@ archivepar2 () {
           print_log "Cleaning old files..."
           rm -f "${out}.tar.zst" "${out}.par2"* "$manifest" "$logfile" 2>/dev/null
           echo "==================================================" > "$logfile"
-          echo "              ARCHIVEPAR2 SESSION LOG             " >> "$logfile"
+          echo "             ARCHIVEPAR2 SESSION LOG             " >> "$logfile"
           echo "==================================================" >> "$logfile"
         else
           print_log "Operation aborted by user. Existing files were preserved."
@@ -328,11 +338,24 @@ archivepar2 () {
 
       tar -cf - -C "$parent_dir" "$base" \
       | zstd -T0 -10 --long=27 -v --progress 2> >(tee /tmp/zstd_err_$$ >&2) \
-      | tee >(b3sum | awk -v f="${out}.tar.zst" '{print $1 "  " f}' >> "$manifest") \
+      | tee >(
+          set -o pipefail
+          b3sum | awk -v f="${out}.tar.zst" '{print $1 "  " f}' >> "$manifest"
+          echo $? > /tmp/b3sum_status_$$
+        ) \
       > "${out}.tar.zst"
 
-      [[ $? -eq 0 ]] || { print_log "ERROR: archive creation failed"; return 1; }
-      sleep 0.5
+      local pipe_status=( "${PIPESTATUS[@]}" )
+      local pid_b3sum=$!
+
+      wait "$pid_b3sum"
+      local b3sum_exit=0
+      [[ -f /tmp/b3sum_status_$$ ]] && b3sum_exit=$(< /tmp/b3sum_status_$$)
+
+      [[ ${pipe_status[0]} -eq 0 && ${pipe_status[1]} -eq 0 && $b3sum_exit -eq 0 ]] || {
+        print_log "ERROR: archive creation or global hashing failed"
+        return 1
+      }
       [[ -s "$manifest" ]] || { print_log "ERROR: BLAKE3 manifest was not generated"; return 1; }
 
       zstd_golden_line=$(tr '\r' '\n' < /tmp/zstd_err_$$ | grep -E 'GiB|MiB|B =>' | tail -n1 | sed 's/^[ \t]*//')
@@ -374,7 +397,6 @@ archivepar2 () {
   t_end=$(date +%s)
   t_total=$(format_duration $((t_end - t_start)))
 
-  
   {
     echo "--------------------------------------------------"
     echo "                PERFORMANCE SUMMARY"
