@@ -1,13 +1,16 @@
-# Version Details: v0.16.3.2a
+# Version Details: v0.16.3.2b
 # Change:
-#   - Fixed trap cleanup: _a2_handle_signal now calls _a2_cleanup explicitly
-#     and exits. Previously, bash terminated the process after the trap
-#     returned, so the normal flow never reached the final _a2_cleanup call,
-#     leaving .archivepar2.lockdir orphaned and process groups alive.
-#   - Added _a2_in_cleanup guard to prevent reentrance.
-#   - Improved lock-held diagnostic: uses fuser(1) to get the holder PID
-#     atomically when available, falls back to lockdir metadata. Omits
-#     empty Started/Command lines instead of printing blanks.
+#   - Use $BASHPID instead of $$ for the lock owner PID. $$ returns the PID
+#     of the parent shell (the interactive shell), not the subshell running
+#     archivepar2 when invoked with '&'. $BASHPID is the actual PID of the
+#     bash process executing the function.
+#   - Remove fuser(1) from the lock-held diagnostic. fuser lists every process
+#     that has the lock file open, including the current process (which opens
+#     the fd before attempting flock). This produced wrong or misleading PIDs.
+#     We now read the owner PID from lockdir/pid, which the holder writes
+#     atomically after acquiring the lock. In the rare race where the holder
+#     has not yet written it, the diagnostic degrades to "PID : ?".
+#   - _a2_release_lock compares against $BASHPID for the same reason.
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
     echo "Error: no input folder provided" >&2
@@ -224,14 +227,11 @@ archivepar2 () {
   }
 
   _a2_handle_signal() {
-    # Guard against reentrance: if we are already inside _a2_cleanup,
-    # a second signal must not re-enter it.
     (( _a2_in_cleanup )) && return
 
     abort_flag=1
     echo -e "\n[ABORT] Operation interrupted by user or signal." >&2
 
-    # Terminate all tracked process groups (best-effort).
     local local_pgid
     for local_pgid in "$pgid_par2" "$pgid_main_pipeline" "$pgid_b3sum" "$pgid_helper" "$pgid_check" "$pgid_resume"; do
       if [[ -n "$local_pgid" ]] && [[ "$local_pgid" =~ ^[0-9]+$ ]]; then
@@ -241,9 +241,6 @@ archivepar2 () {
       fi
     done
 
-    # Bash terminates the process after a SIGINT/SIGTERM trap returns.
-    # The normal flow (which calls _a2_cleanup at the end) therefore
-    # never runs. We must release the lock and clean up here explicitly.
     _a2_cleanup
 
     exit 1
@@ -313,7 +310,7 @@ archivepar2 () {
   echo "Output Base Name: $out" >> "$logfile"
   echo "Target Directory: $backup_dir" >> "$logfile"
   echo "Arguments Used  : Single Mode=$single_mode | Fast Mode=$fast_mode | Max Size=$maxsize" >> "$logfile"
-  echo "Version         : v0.16.3.2a" >> "$logfile"
+  echo "Version         : v0.16.3.2b" >> "$logfile"
   echo "--------------------------------------------------" >> "$logfile"
 
   _a2_print_log() {
@@ -430,13 +427,11 @@ archivepar2 () {
   }
 
   # ============================================================
-  # v0.16.3.2 — Layered locking
+  # v0.16.3.2 / v0.16.3.2b — Layered locking
   # ============================================================
   _a2_acquire_lock() {
     local target="$1"
 
-    # Detect filesystem type; warn (do not abort) for FS known to
-    # have unreliable locking semantics.
     lock_fs_type=$(stat -f -c %T "$target" 2>/dev/null || echo "unknown")
     case "$lock_fs_type" in
       sshfs|fuse*|cifs|smb*|9p)
@@ -451,23 +446,16 @@ archivepar2 () {
         return 1
       }
       if ! flock -n "$lock_fd"; then
+        # Lock is held by another process. Read owner metadata from
+        # lockdir/pid. In the rare race where the holder has acquired
+        # flock but has not yet written its lockdir metadata, this
+        # degrades to "PID : ?".
         local holder_pid="" holder_time="" holder_cmd=""
-
-        # Try to get the holder PID atomically via fuser. This works
-        # even if the holder has not yet written its lockdir metadata
-        # (race condition between flock and mkdir lockdir).
-        if command -v fuser >/dev/null 2>&1; then
-          holder_pid=$(fuser "$lock_file" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -n1)
-        fi
-
-        # Fallback: read from lockdir (may be incomplete in a race).
-        if [[ -z "$holder_pid" ]] && [[ -d "$lock_dir" ]]; then
+        if [[ -d "$lock_dir" ]]; then
           holder_pid=$(cat "$lock_dir/pid" 2>/dev/null)
+          holder_time=$(cat "$lock_dir/time" 2>/dev/null)
+          holder_cmd=$(cat "$lock_dir/cmd" 2>/dev/null)
         fi
-
-        # Auxiliary metadata (best-effort, may be empty in a race).
-        [[ -d "$lock_dir" ]] && holder_time=$(cat "$lock_dir/time" 2>/dev/null)
-        [[ -d "$lock_dir" ]] && holder_cmd=$(cat "$lock_dir/cmd" 2>/dev/null)
 
         _a2_print_log "[LOCK] ERROR: another archivepar2 instance holds the lock on $target"
         _a2_print_log "[LOCK]   PID     : ${holder_pid:-?}"
@@ -530,28 +518,33 @@ archivepar2 () {
     fi
 
     # --- Layer 3: metadata inside lockdir ---
-    echo "$$" > "$lock_dir/pid" 2>/dev/null || true
+    #
+    # $BASHPID is used instead of $$ so that the recorded PID is the
+    # actual bash process running this function. When invoked as
+    # 'archivepar2 mydata &', $$ returns the parent shell's PID, not
+    # the subshell's. $BASHPID is correct in both cases.
+    echo "$BASHPID" > "$lock_dir/pid" 2>/dev/null || true
     date '+%Y-%m-%d %H:%M:%S' > "$lock_dir/time" 2>/dev/null || true
-    if [[ -r "/proc/$$/cmdline" ]]; then
-      tr '\0' ' ' < "/proc/$$/cmdline" > "$lock_dir/cmd" 2>/dev/null || true
+    if [[ -r "/proc/$BASHPID/cmdline" ]]; then
+      tr '\0' ' ' < "/proc/$BASHPID/cmdline" > "$lock_dir/cmd" 2>/dev/null || true
     else
-      ps -p "$$" -o args= > "$lock_dir/cmd" 2>/dev/null || echo "archivepar2" > "$lock_dir/cmd"
+      ps -p "$BASHPID" -o args= > "$lock_dir/cmd" 2>/dev/null || echo "archivepar2" > "$lock_dir/cmd"
     fi
 
     lock_acquired=1
-    _a2_print_log "[LOCK] Acquired lock on $target (PID $$, fs=$lock_fs_type)"
+    _a2_print_log "[LOCK] Acquired lock on $target (PID $BASHPID, fs=$lock_fs_type)"
     return 0
   }
 
   _a2_release_lock() {
     (( lock_acquired )) || return 0
 
-    # Remove lockdir: the lockdir IS the lock for the mkdir layer.
-    # If we don't remove it, it becomes a permanent stale lock.
+    # Remove lockdir if we own it. Compare against $BASHPID (not $$),
+    # matching what _a2_acquire_lock wrote.
     if [[ -d "$lock_dir" ]]; then
       local owner_pid=""
       owner_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
-      if [[ "$owner_pid" == "$$" ]]; then
+      if [[ "$owner_pid" == "$BASHPID" ]]; then
         rm -rf "$lock_dir" 2>/dev/null || true
       fi
     fi
@@ -571,7 +564,7 @@ archivepar2 () {
     # backup_dir use the same inode. The file is 0 bytes and is
     # filtered out of the parts glob by its leading dot.
     #
-    # v0.16.3.2b will relocate this file to $XDG_RUNTIME_DIR to
+    # v0.16.3.2c will relocate this file to $XDG_RUNTIME_DIR to
     # eliminate the visual clutter without reintroducing the race.
     if command -v flock >/dev/null 2>&1; then
       exec {lock_fd}>&- 2>/dev/null || true
@@ -600,7 +593,6 @@ archivepar2 () {
     _a2_print_log "[FS] WARN: could not determine filesystem device for $backup_dir"
   fi
 
-  # ... (daqui em diante, código IDÊNTICO à v0.16.3.2) ...
   _a2_launch_job() {
     local _a2_target_pid="$1"
     local _a2_target_pgid="$2"
