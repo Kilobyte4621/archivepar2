@@ -1,5 +1,7 @@
-# Version Details: v0.16.3
-# Fix: Restored real-time zstd compression progress output to the terminal.
+# Version Details: v0.16.3.1
+# Change: Added layout detection (_a2_detect_layout, _a2_resolve_active_dir),
+#         same-filesystem check for future staging, and diagnostic logging.
+#         No functional change: behaves identically to v0.16.3 on legacy layout.
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
     echo "Error: no input folder provided" >&2
@@ -203,7 +205,9 @@ archivepar2 () {
       unset -f _a2_print_log _a2_format_duration _a2_check_content_integrity \
                _a2_update_parts_array _a2_show_manifest _a2_verify_manifest_single \
                _a2_verify_manifest_split _a2_validate_global_manifest _a2_cleanup \
-               _a2_handle_signal _a2_init_fail _a2_restore_traps _a2_launch_job _a2_reap_job 2>/dev/null || true
+               _a2_handle_signal _a2_init_fail _a2_restore_traps _a2_launch_job _a2_reap_job \
+               _a2_detect_layout _a2_resolve_active_dir _a2_log_layout_diagnostics \
+               _a2_check_same_filesystem 2>/dev/null || true
     else
       return 1
     fi
@@ -277,6 +281,7 @@ archivepar2 () {
   echo "Output Base Name: $out" >> "$logfile"
   echo "Target Directory: $backup_dir" >> "$logfile"
   echo "Arguments Used  : Single Mode=$single_mode | Fast Mode=$fast_mode | Max Size=$maxsize" >> "$logfile"
+  echo "Version         : v0.16.3.1" >> "$logfile"
   echo "--------------------------------------------------" >> "$logfile"
 
   _a2_print_log() {
@@ -288,11 +293,157 @@ archivepar2 () {
     printf "%02d:%02d" $((sec / 60)) $((sec % 60))
   }
 
+  # ============================================================
+  # v0.16.3.1 — Layout detection and diagnostics
+  # ============================================================
+  #
+  # Detects whether the backup directory uses:
+  #   - "legacy"    : files directly in $backup_dir (v0.16.3 and earlier)
+  #   - "versioned" : $backup_dir/current -> $backup_dir/v<timestamp>/
+  #   - "empty"     : no recognizable backup artifacts present
+  #
+  # This is purely informational in v0.16.3.1. Subsequent revisions
+  # (v0.16.3.3+) will use this to decide between legacy and versioned
+  # operation.
+  #
+  _a2_detect_layout() {
+    local target="$1"
+
+    # Versioned layout: symlink 'current' OR any v<timestamp> subdirectory
+    if [[ -L "$target/current" ]]; then
+      echo "versioned"
+      return 0
+    fi
+    if compgen -G "$target/v[0-9]*-[0-9]*" > /dev/null; then
+      echo "versioned"
+      return 0
+    fi
+
+    # Legacy layout: recognizable backup artifacts directly in target
+    if compgen -G "$target/${out}.tar.zst.part-*" > /dev/null; then
+      echo "legacy"
+      return 0
+    fi
+    if [[ -f "$target/${out}.tar.zst" ]] || [[ -f "$target/${out}.blake3" ]]; then
+      echo "legacy"
+      return 0
+    fi
+
+    echo "empty"
+    return 0
+  }
+
+  # Returns the directory containing the active backup artifacts.
+  #
+  #   legacy/empty -> $backup_dir itself
+  #   versioned    -> realpath of $backup_dir/current (if symlink exists),
+  #                   otherwise the lexicographically latest v<timestamp>/
+  #
+  # In v0.16.3.1, only "legacy" and "empty" are possible in practice,
+  # so this always returns $backup_dir. The versioned branch is present
+  # for forward compatibility and is exercised only if a user manually
+  # creates a versioned layout.
+  #
+  _a2_resolve_active_dir() {
+    local target="$1"
+    local layout
+    layout=$(_a2_detect_layout "$target")
+
+    case "$layout" in
+      versioned)
+        if [[ -L "$target/current" ]]; then
+          local resolved
+          resolved=$(realpath "$target/current" 2>/dev/null) || {
+            echo "$target"
+            return 0
+          }
+          echo "$resolved"
+        else
+          local latest=""
+          local v
+          # Lexicographic sort works because the format is vYYYYMMDD-HHMMSS
+          while IFS= read -r v; do
+            [[ -n "$v" ]] && latest="$v"
+          done < <(ls -1d "$target"/v[0-9]*-[0-9]* 2>/dev/null | sort)
+          if [[ -n "$latest" ]]; then
+            echo "$latest"
+          else
+            echo "$target"
+          fi
+        fi
+        ;;
+      legacy|empty|*)
+        echo "$target"
+        ;;
+    esac
+  }
+
+  _a2_log_layout_diagnostics() {
+    local target="$1"
+    local layout active
+    layout=$(_a2_detect_layout "$target")
+    active=$(_a2_resolve_active_dir "$target")
+
+    _a2_print_log "[LAYOUT] Detected layout: $layout"
+    _a2_print_log "[LAYOUT] Active dir     : $active"
+
+    if [[ "$layout" == "versioned" ]]; then
+      if [[ -L "$target/current" ]]; then
+        local link_target
+        link_target=$(readlink "$target/current" 2>/dev/null || echo "?")
+        _a2_print_log "[LAYOUT] current -> $link_target"
+      else
+        _a2_print_log "[LAYOUT] No 'current' symlink present; using latest v* dir"
+      fi
+
+      local -a versions=()
+      local v
+      while IFS= read -r v; do
+        [[ -n "$v" ]] && versions+=("$v")
+      done < <(ls -1d "$target"/v[0-9]*-[0-9]* 2>/dev/null | sort)
+      if [[ ${#versions[@]} -gt 0 ]]; then
+        _a2_print_log "[LAYOUT] Version history (${#versions[@]}):"
+        for v in "${versions[@]}"; do
+          _a2_print_log "[LAYOUT]   - $(basename "$v")"
+        done
+      fi
+    fi
+  }
+
+  # Verifies that two paths reside on the same filesystem device.
+  # This matters for v0.16.3.3+, where the staging directory must be
+  # renameable into the backup directory without copying data.
+  #
+  # Returns 0 if same device, 1 otherwise. On platforms without
+  # GNU stat -c %d, returns 0 (assume same) to avoid false negatives.
+  #
+  _a2_check_same_filesystem() {
+    local path_a="$1"
+    local path_b="$2"
+
+    local dev_a dev_b
+    dev_a=$(stat -c %d "$path_a" 2>/dev/null) || return 0
+    dev_b=$(stat -c %d "$path_b" 2>/dev/null) || return 0
+
+    [[ -n "$dev_a" ]] && [[ -n "$dev_b" ]] && [[ "$dev_a" == "$dev_b" ]]
+  }
+
   echo "==============================="
   echo "Archiving: $arch"
   echo "Working dir: $backup_dir"
   echo "Output base: $out"
   echo "==============================="
+
+  _a2_log_layout_diagnostics "$backup_dir"
+
+  # Same-filesystem check for future staging (v0.16.3.3+).
+  # In v0.16.3.1 we only log the result; we do not abort on mismatch
+  # because staging does not exist yet.
+  if _a2_check_same_filesystem "$backup_dir" "$backup_dir"; then
+    _a2_print_log "[FS] Backup directory filesystem check: same-device trivially OK"
+  else
+    _a2_print_log "[FS] WARN: could not determine filesystem device for $backup_dir"
+  fi
 
   _a2_launch_job() {
     local _a2_target_pid="$1"
@@ -486,19 +637,25 @@ archivepar2 () {
 
     (( abort_flag )) && return 1
 
+    # v0.16.3.1: use _a2_resolve_active_dir so that future versioned
+    # layouts are handled transparently. On legacy layout this returns
+    # $backup_dir, identical to v0.16.3 behavior.
+    local active_dir
+    active_dir=$(_a2_resolve_active_dir "$backup_dir")
+
     local status=0
     if (( single_mode )); then
         _a2_launch_job pid_check pgid_check bash -c '
           set -o pipefail
           cd "$1" || exit 1
           zstd -dc --progress "$2/$3.tar.zst" | tar --diff -f -
-        ' _ "$parent_dir" "$backup_dir" "$out"
+        ' _ "$parent_dir" "$active_dir" "$out"
     else
         _a2_launch_job pid_check pgid_check bash -c '
           set -o pipefail
           cd "$1" || exit 1
           cat "${@:3}" | zstd -dc --progress | tar --diff -f -
-        ' _ "$parent_dir" "$backup_dir" "${parts[@]/#/$backup_dir/}"
+        ' _ "$parent_dir" "$active_dir" "${parts[@]/#/$active_dir/}"
     fi
 
     if (( $? != 0 )); then
@@ -533,6 +690,8 @@ archivepar2 () {
     local orig_nullglob=0
     [[ -o nullglob ]] && orig_nullglob=1
     shopt -s nullglob
+    # v0.16.3.1: unchanged. Still globs against $PWD ($backup_dir).
+    # Subsequent revisions will parameterize this by active_dir.
     parts=( "${out}.tar.zst.part-"* )
     (( orig_nullglob )) || shopt -u nullglob
   }
@@ -812,7 +971,6 @@ archivepar2 () {
 
       (( abort_flag )) && { _a2_cleanup; return 1; }
 
-      # v0.16.3 FIX: Envia o progresso do zstd para o terminal via tee mantendo o log gravado no zstd_err_file
       if ! _a2_launch_job pid_main_pipeline pgid_main_pipeline bash -c '
         set -o pipefail
         zstd_cmd="tar -cf - -C '\''$1'\'' '\''$2'\'' | zstd -T0 -10 --long=27 -v --progress | tee '\''$4'\'' | split -d -a 3 -b '\''$5'\'' - '\''$6.tar.zst.part-'\''"
@@ -1022,7 +1180,6 @@ archivepar2 () {
 
       (( abort_flag )) && { _a2_cleanup; return 1; }
 
-      # v0.16.3 FIX: Exibe o progresso do zstd no terminal no modo single também
       if ! _a2_launch_job pid_main_pipeline pgid_main_pipeline bash -c '
         set -o pipefail
         zstd_cmd="tar -cf - -C '\''$1'\'' '\''$2'\'' | zstd -T0 -10 --long=27 -v --progress | tee '\''$4'\'' > '\''$5.tar.zst'\''"
