@@ -1,4 +1,4 @@
-# Version Details: v0.15.42
+# Version Details: v0.16
 # Fix: Post-SIGKILL group confirmation in _a2_launch_job failure path; orphaned PGIDs registered in _a2_orphan_pgids array so _a2_cleanup can retry termination.
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
