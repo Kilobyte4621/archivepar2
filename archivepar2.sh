@@ -1,5 +1,5 @@
-# Version Details: v0.16.2
-# Fix: Cleaned up hidden control characters and fixed log extraction.
+# Version Details: v0.16.3
+# Fix: Restored real-time zstd compression progress output to the terminal.
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
     echo "Error: no input folder provided" >&2
@@ -74,6 +74,7 @@ archivepar2 () {
   zstd_err_file=$(mktemp /tmp/archivepar2_zstd_err_XXX.log) || {
     echo "ERROR: failed to create zstd error temp file" >&2
     rm -rf "$fifo_dir" "$status_file"
+    _a2_init_fail
     return 1
   }
 
@@ -811,12 +812,11 @@ archivepar2 () {
 
       (( abort_flag )) && { _a2_cleanup; return 1; }
 
+      # v0.16.3 FIX: Envia o progresso do zstd para o terminal via tee mantendo o log gravado no zstd_err_file
       if ! _a2_launch_job pid_main_pipeline pgid_main_pipeline bash -c '
         set -o pipefail
-        tar -cf - -C "$1" "$2" \
-        | zstd -T0 -10 --long=27 -v --progress 2> "$3" \
-        | tee "$4" \
-        | split -d -a 3 -b "$5" - "$6.tar.zst.part-"
+        zstd_cmd="tar -cf - -C '\''$1'\'' '\''$2'\'' | zstd -T0 -10 --long=27 -v --progress | tee '\''$4'\'' | split -d -a 3 -b '\''$5'\'' - '\''$6.tar.zst.part-'\''"
+        script -q -f "$3" -c "$zstd_cmd"
       ' _ "$parent_dir" "$base" "$zstd_err_file" "$hash_fifo" "$maxsize" "$out"; then
         _a2_print_log "ERROR: Failed to launch main compression pipeline job."
         _a2_cleanup
@@ -952,7 +952,7 @@ archivepar2 () {
     fi
 
     if [[ -f "$par2_tty_file" ]]; then
-      tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[a-zA-Z]//g; s/\r/\n/g' | grep -vE '(%|Constructing:|Processing:|Opening:)' >> "$logfile"
+      tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
     fi
 
     (( abort_flag )) && { _a2_cleanup; return 1; }
@@ -1022,12 +1022,11 @@ archivepar2 () {
 
       (( abort_flag )) && { _a2_cleanup; return 1; }
 
+      # v0.16.3 FIX: Exibe o progresso do zstd no terminal no modo single também
       if ! _a2_launch_job pid_main_pipeline pgid_main_pipeline bash -c '
         set -o pipefail
-        tar -cf - -C "$1" "$2" \
-        | zstd -T0 -10 --long=27 -v --progress 2> "$3" \
-        | tee "$4" \
-        > "$5.tar.zst"
+        zstd_cmd="tar -cf - -C '\''$1'\'' '\''$2'\'' | zstd -T0 -10 --long=27 -v --progress | tee '\''$4'\'' > '\''$5.tar.zst'\''"
+        script -q -f "$3" -c "$zstd_cmd"
       ' _ "$parent_dir" "$base" "$zstd_err_file" "$hash_fifo" "$out"; then
         _a2_print_log "ERROR: Failed to launch main compression pipeline job."
         _a2_cleanup
@@ -1121,7 +1120,7 @@ archivepar2 () {
     fi
 
     if [[ -f "$par2_tty_file" ]]; then
-      tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[a-zA-Z]//g; s/\r/\n/g' | grep -vE '(%|Constructing:|Processing:|Opening:)' >> "$logfile"
+      tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
     fi
 
     (( abort_flag )) && { _a2_cleanup; return 1; }
