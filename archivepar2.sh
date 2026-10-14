@@ -236,6 +236,8 @@ archivepar2 () {
                _a2_cleanup_staging _a2_prune_obsolete_parts \
                _a2_is_versioned_layout _a2_generate_version_name \
                _a2_migrate_legacy_to_versioned _a2_commit_versioned \
+               _a2_remove_orphan_stagings _a2_create_staging _a2_commit_staging \
+               _a2_cleanup_staging _a2_prune_obsolete_parts \
                _a2_prune_old_versions 2>/dev/null || true
     else
       return 1
@@ -639,6 +641,115 @@ archivepar2 () {
     (( removed > 0 )) && _a2_print_log "[PRUNE] Removed $removed old version(s)."
     return 0
   }
+
+  _a2_commit_staging() {
+    local staging="$1"
+    local target="$2"
+
+    [[ -d "$staging" ]] || {
+      _a2_print_log "[COMMIT] ERROR: staging directory does not exist: $staging"
+      return 1
+    }
+
+    _a2_print_log "[COMMIT] Publishing staging to $target..."
+
+    local orig_nullglob=0
+    [[ -o nullglob ]] && orig_nullglob=1
+    shopt -s nullglob
+
+    local -a part_files=( "$staging"/*.tar.zst.part-* )
+    local -a manifest_files=( "$staging"/*.blake3 )
+    local -a par2_files=( "$staging"/*.par2 "$staging"/*.vol*.par2 )
+
+    local moved=0
+    local f base
+
+    for f in "${part_files[@]}"; do
+      [[ -e "$f" ]] || continue
+      base=$(basename "$f")
+      mv -f "$f" "$target/$base" 2>/dev/null || {
+        _a2_print_log "[COMMIT] ERROR: failed to publish part '$base'"
+        (( orig_nullglob )) || shopt -u nullglob
+        return 1
+      }
+      (( ++moved ))
+    done
+
+    for f in "${manifest_files[@]}"; do
+      [[ -e "$f" ]] || continue
+      base=$(basename "$f")
+      mv -f "$f" "$target/$base" 2>/dev/null || {
+        _a2_print_log "[COMMIT] ERROR: failed to publish manifest '$base'"
+        (( orig_nullglob )) || shopt -u nullglob
+        return 1
+      }
+      (( ++moved ))
+    done
+
+    for f in "${par2_files[@]}"; do
+      [[ -e "$f" ]] || continue
+      base=$(basename "$f")
+      mv -f "$f" "$target/$base" 2>/dev/null || {
+        _a2_print_log "[COMMIT] ERROR: failed to publish par2 '$base'"
+        (( orig_nullglob )) || shopt -u nullglob
+        return 1
+      }
+      (( ++moved ))
+    done
+
+    (( orig_nullglob )) || shopt -u nullglob
+
+    _a2_print_log "[COMMIT] Published $moved file(s)."
+    staging_committed=1
+    return 0
+  }
+
+      _a2_prune_obsolete_parts() {
+    local target="$1"
+    local manifest_name="${out}.blake3"
+
+    [[ -f "$target/$manifest_name" ]] || {
+      _a2_print_log "[PRUNE] WARN: manifest not found in $target; skipping obsolete-part prune"
+      return 0
+    }
+
+    local -A expected=()
+    local line name
+    while IFS= read -r line; do
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      [[ -z "${line// }" ]] && continue
+      name="${line##*[[:space:]]}"
+      name="${name##*/}"
+      [[ "$name" == *".tar.zst.part-"* ]] || continue
+      expected["$name"]=1
+    done < "$target/$manifest_name"
+
+    local orig_nullglob=0
+    [[ -o nullglob ]] && orig_nullglob=1
+    shopt -s nullglob
+
+    local -a existing=( "$target"/${out}.tar.zst.part-* )
+    (( orig_nullglob )) || shopt -u nullglob
+
+    local f base
+    local removed=0
+    for f in "${existing[@]}"; do
+      [[ -e "$f" ]] || continue
+      base=$(basename "$f")
+      if [[ -z "${expected[$base]:-}" ]]; then
+        if rm -f "$f" 2>/dev/null; then
+          (( ++removed ))
+          _a2_print_log "[PRUNE] Removed obsolete part: $base"
+        else
+          _a2_print_log "[PRUNE] WARN: could not remove obsolete part: $base"
+        fi
+      fi
+    done
+
+    (( removed > 0 )) && _a2_print_log "[PRUNE] Removed $removed obsolete part(s)."
+    return 0
+  }
+
 
     _a2_acquire_lock() {
     local target="$1"
@@ -1424,6 +1535,7 @@ archivepar2 () {
           return 1
         fi
         _a2_prune_obsolete_parts "$backup_dir"
+        _a2_cleanup_staging
       else
         if ! _a2_commit_versioned "$staging_dir" "$backup_dir"; then
           _a2_print_log "ERROR: versioned commit failed; previous backup remains active"
@@ -1431,9 +1543,9 @@ archivepar2 () {
           return 1
         fi
         _a2_prune_old_versions "$backup_dir" "$keep_versions"
+        staging_dir=""
+        staging_committed=0
       fi
-      staging_dir=""
-      staging_committed=0
     fi
 
     (( abort_flag )) && { _a2_cleanup; return 1; }
@@ -1643,6 +1755,7 @@ archivepar2 () {
           _a2_cleanup
           return 1
         fi
+        _a2_cleanup_staging
       else
         if ! _a2_commit_versioned "$staging_dir" "$backup_dir"; then
           _a2_print_log "ERROR: versioned commit failed; previous backup remains active"
@@ -1650,10 +1763,11 @@ archivepar2 () {
           return 1
         fi
         _a2_prune_old_versions "$backup_dir" "$keep_versions"
+        staging_dir=""
+        staging_committed=0
       fi
-      staging_dir=""
-      staging_committed=0
     fi
+    
     (( abort_flag )) && { _a2_cleanup; return 1; }
 
     if (( ! par2_done )); then
