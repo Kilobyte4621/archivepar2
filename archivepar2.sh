@@ -1,4 +1,4 @@
-# Version Details: v0.17
+# Version Details: v0.17-rc1
 # Change: Versioned layout with atomic symlink swap; PAR2 resume path fix;
 #         --no-migrate keeps legacy commit.
 archivepar2 () {
@@ -331,7 +331,7 @@ archivepar2 () {
   echo "Output Base Name: $out" >> "$logfile"
   echo "Target Directory: $backup_dir" >> "$logfile"
   echo "Arguments Used  : Single Mode=$single_mode | Fast Mode=$fast_mode | Max Size=$maxsize | Keep=$keep_versions | No-Migrate=$no_migrate" >> "$logfile"
-  echo "Version         : v0.17" >> "$logfile"
+  echo "Version         : v0.17-rc1" >> "$logfile"
   echo "--------------------------------------------------" >> "$logfile"
 
   _a2_print_log() {
