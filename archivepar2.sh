@@ -224,7 +224,7 @@ archivepar2 () {
     (( _a2_orig_pipefail )) || set +o pipefail
     _a2_restore_traps
 
-    if (( cleanup_failed == 0 )); then
+        if (( cleanup_failed == 0 )); then
       _a2_cleaned=1
       unset -f _a2_print_log _a2_format_duration _a2_check_content_integrity \
                _a2_update_parts_array _a2_show_manifest _a2_verify_manifest_single \
@@ -236,8 +236,6 @@ archivepar2 () {
                _a2_cleanup_staging _a2_prune_obsolete_parts \
                _a2_is_versioned_layout _a2_generate_version_name \
                _a2_migrate_legacy_to_versioned _a2_commit_versioned \
-               _a2_remove_orphan_stagings _a2_create_staging _a2_commit_staging \
-               _a2_cleanup_staging _a2_prune_obsolete_parts \
                _a2_prune_old_versions 2>/dev/null || true
     else
       return 1

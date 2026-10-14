@@ -348,13 +348,17 @@ Note also that the `.archivepar2.lock` file persists intentionally (see "About `
 
 ---
 
-## 2. Restoration & Recovery: `restorepar2` (v0.4)
+## 2. Restoration & Recovery: `restorepar2` (v0.5)
 
 This script acts as the guardian of your data, used to verify the health of archives and restore them.
 
+Starting with **v0.5**, `restorepar2` supports the **versioned backup layout** introduced in `archivepar2` v0.17. It resolves the `current` symlink (or the newest `v<timestamp>/` directory) automatically. Legacy flat layouts are still fully supported. An optional `--version=<name>` flag selects a specific version.
+
 ### Key Functionalities
 
-* **Automatic Detection:** The script automatically fingerprints the backup directory to determine if it is dealing with a single-file or split-file archive.
+* **Automatic Layout Resolution (v0.5):** Detects whether the backup directory uses the versioned layout (`current` symlink or `v<timestamp>/` subdirectories) or the legacy flat layout, and operates on the correct directory.
+* **Version Selection (v0.5):** `--version=<name>` allows restoring a specific version from a multi-version backup directory.
+* **Automatic Detection:** The script automatically fingerprints the archive to determine if it is dealing with a single-file or split-file archive.
 * **PAR2 Self-Healing:** It runs a block integrity check. If the archive is found to be corrupted, it automatically attempts a **`par2 repair`** to recover missing or damaged data using redundancy blocks.
 * **Verified Extraction:** When run in `extract` mode, it unpacks the archive into a new directory suffixed with `-restored` and performs real-time BLAKE3 hashing to verify data integrity during extraction.
 * **Full Structural Check (`--FULL`):** Allows for deeper levels of structural verification of the archive files.
@@ -363,35 +367,52 @@ This script acts as the guardian of your data, used to verify the health of arch
 
 * **`EXTRACT`**: Switches the mode from verification to **full restoration**. The script will unpack the archive into a new directory suffixed with `-restored`.
 * **`--FULL`, `--FULL=1`, or `--FULL=2`**: Enables **Deep Structural Checks**. These options trigger different levels of structural integrity verification beyond the standard PAR2 and BLAKE3 checks.
+* **`--version=<name>`** (v0.5): Selects a specific version from a versioned backup directory. Accepts both `--version=v20260114-120000` and `--version v20260114-120000`. If not specified, the active version (`current`) is used.
 * **Input Folder**: The first non-flag argument is treated as the path to the backup directory.
 
 ### Detailed Workflow of `restorepar2`
 
 The `restorepar2` utility is the "guardian" of the archive, focusing on resilience and verified extraction.
 
-1. **Archive Fingerprinting**:
+1. **Layout Resolution (v0.5)**:
+* If the input directory contains `current` (symlink or directory), the target is resolved to `realpath current`.
+* Else, if the input directory contains `v<timestamp>/` subdirectories, the newest one (lexicographic sort) is used.
+* Else, if the input directory contains archive files directly (`.tar.zst` or `.tar.zst.part-*`), the legacy flat layout is used.
+* If `--version=<name>` is specified, that specific `v<name>/` subdirectory is used, overriding the automatic resolution.
+* The resolved directory is reported as `[LAYOUT] Active directory: ...`.
+
+2. **Archive Fingerprinting**:
 * The script automatically detects whether it is working with a **single-file** or **split-file** archive by scanning for `.tar.zst` or `.tar.zst.part-*` patterns.
 * It identifies the required `.par2` index file to begin the recovery process.
 
-
-2. **Phase 1: Proactive Resilience (Verify & Repair)**:
+3. **Phase 1: Proactive Resilience (Verify & Repair)**:
 * The script first runs `par2 verify`.
-* **Auto-Repair**: A critical feature of v0.4 is that if verification fails, it does not simply quit; it immediately attempts a **`par2 repair`** to fix corrupted blocks using the redundancy data.
+* **Auto-Repair**: If verification fails, it immediately attempts a **`par2 repair`** to fix corrupted blocks using the redundancy data.
 
+4. **Phase 2: Cryptographic Validation**:
+* It utilizes the **BLAKE3 manifest** to verify the archive's integrity. The `verify_blake3_match` helper isolates the global hash entry (`.tar.zst`) from the multi-line manifest format.
 
-3. **Phase 2: Cryptographic Validation**:
-* It utilizes the **BLAKE3 manifest** to verify the archive’s integrity. The `verify_blake3_match` helper is designed to isolate the hash of the archive files from the multi-line manifest format.
-
-
-4. **Phase 3: Verified Extraction**:
-* If the `EXTRACT` mode is used, the script creates a new directory suffixed with **`-restored`** to prevent overwriting existing data.
+5. **Phase 3: Verified Extraction**:
+* If the `EXTRACT` mode is used, the script creates a new directory suffixed with **`-restored`**.
+* For versioned backups, the extract directory is `${backup_root%-bak}-restored` (e.g., `/path/to/mydata-restored/`).
+* If a non-active version is explicitly selected via `--version`, the version name is appended to the extract directory (e.g., `/path/to/mydata-restored.v20260114-120000/`), preventing accidental overwrite of a previous extraction.
 * Extraction is performed with **real-time BLAKE3 hashing**, ensuring the data being written to disk matches the cryptographic signature of the original archive.
 
-
-5. **Performance Auditing**:
+6. **Performance Auditing**:
 * Upon completion, the script generates a **Performance Summary**, detailing the time spent on PAR2 checks, BLAKE3 verification, structural checks, and extraction.
 
+### Version Comparison: v0.4 vs. v0.5
 
+| Feature | v0.4 | v0.5 |
+|---|---|---|
+| Supported layouts | Flat / legacy only | **Flat / legacy + versioned** (`current` symlink or `v<timestamp>/`) |
+| Version selection | N/A | **`--version=<name>`** flag, with both `--version=v<ts>` and `--version v<ts>` syntaxes |
+| `current` symlink handling | N/A | Resolved via `realpath` to the active version directory |
+| Fallback when `current` missing | N/A | Automatically uses the newest `v<timestamp>/` subdirectory |
+| Extract directory naming | `${input%-bak}-restored` | Same, plus the version name is appended when a non-active version is restored |
+| PAR2 verify/repair | Yes | Yes (unchanged) |
+| BLAKE3 verification | Yes | Yes (unchanged) |
+| Real-time BLAKE3 during extract | Yes | Yes (unchanged) |
 
 ---
 
@@ -401,7 +422,7 @@ The `restorepar2` utility is the "guardian" of the archive, focusing on resilien
 
 A high-level orchestrator that executes the full pipeline: it calls `archivepar2` to create the backup and then immediately triggers `restorepar2` in verification mode. This ensures a backup is only considered "successful" if its integrity is confirmed right after creation.
 
-* **Dynamic Flag Passing**: It is designed to interpret flags and automatically pass them to the underlying engines. For example, flags related to creation (like `--SINGLE`) are passed to `archivepar2`, while restore-level settings are passed to `restorepar2`.
+* **Dynamic Flag Passing**: It is designed to interpret flags and automatically pass them to the underlying engines. For example, flags related to creation (like `--SINGLE`, `--KEEP`) are passed to `archivepar2`, while restore-level settings are passed to `restorepar2`.
 
 ### `folderbkp` (v0.1)
 
@@ -412,7 +433,7 @@ A batch processor that iterates through an entire parent directory, applying the
 
 #### Arguments and flags
 
-* **`[extra_args]`**: Any arguments provided after the parent directory (such as `--FAST`, `--SINGLE`, or a custom part size) are captured and **repassed** to each individual `backup` call.
+* **`[extra_args]`**: Any arguments provided after the parent directory (such as `--FAST`, `--SINGLE`, `--KEEP N`, or a custom part size) are captured and **repassed** to each individual `backup` call.
 * **Environment Handling**: It automatically enables `nullglob` and `dotglob` during execution to ensure that empty directories and hidden files (starting with `.`) are included in the process.
 
 ---
@@ -429,4 +450,4 @@ The utility provides extensive feedback for every session, which is both display
 * **BLAKE3/Structure Checks:** Verification status of cryptographic hashes.
 * **Total Elapsed Time:** A final timer (MM:SS) for the entire operation.
 
-<!-- --- -->
+---
