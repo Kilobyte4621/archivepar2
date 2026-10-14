@@ -1,5 +1,5 @@
-# Version Details: v0.16
-# Fix: Post-SIGKILL group confirmation in _a2_launch_job failure path; orphaned PGIDs registered in _a2_orphan_pgids array so _a2_cleanup can retry termination.
+# Version Details: v0.64
+# Fix: Implemented temporary job control disablement via set +m inside job launcher to completely wipe out interactive terminal job notifications ([1] PID / Done).
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
     echo "Error: no input folder provided" >&2
@@ -78,19 +78,10 @@ archivepar2 () {
     return 1
   }
 
-  local par2_tty_file
-  par2_tty_file=$(mktemp /tmp/archivepar2_par2_tty_XXX.log) || {
-    echo "ERROR: failed to create par2 tty temp file" >&2
-    rm -f "$zstd_err_file"
-    rm -rf "$fifo_dir" "$status_file"
-    _a2_init_fail
-    return 1
-  }
-
   local resume_out_file
   resume_out_file=$(mktemp /tmp/archivepar2_resume_out_XXX.dat) || {
     echo "ERROR: failed to create resume output temp file" >&2
-    rm -f "$zstd_err_file" "$par2_tty_file" "$status_file"
+    rm -f "$zstd_err_file" "$status_file"
     rm -rf "$fifo_dir"
     _a2_init_fail
     return 1
@@ -139,8 +130,6 @@ archivepar2 () {
       fi
     done
 
-    # Processos cujo grupo não pôde ser confirmado encerrado durante _a2_launch_job (falha de lançamento)
-    # são registrados em _a2_orphan_pgids e tentados aqui com o mesmo protocolo TERM→poll→KILL.
     local _a2_op
     for _a2_op in "${_a2_orphan_pgids[@]+"${_a2_orphan_pgids[@]}"}"; do
       if [[ -n "$_a2_op" ]] && [[ "$_a2_op" =~ ^[0-9]+$ ]]; then
@@ -153,7 +142,6 @@ archivepar2 () {
           done
           if kill -0 -- -"$_a2_op" 2>/dev/null; then
             kill -KILL -- -"$_a2_op" 2>/dev/null || true
-            sleep 0.1
           fi
         fi
         if kill -0 -- -"$_a2_op" 2>/dev/null; then
@@ -184,7 +172,7 @@ archivepar2 () {
     done
 
     local f
-    for f in "$zstd_err_file" "$par2_tty_file" "$status_file" "$resume_out_file"; do
+    for f in "$zstd_err_file" "$status_file" "$resume_out_file"; do
       if [[ -f "$f" ]]; then
         rm -f "$f" 2>/dev/null || true
         [[ -f "$f" ]] && cleanup_failed=1
@@ -206,7 +194,7 @@ archivepar2 () {
       unset -f _a2_print_log _a2_format_duration _a2_check_content_integrity \
                _a2_update_parts_array _a2_show_manifest _a2_verify_manifest_single \
                _a2_verify_manifest_split _a2_validate_global_manifest _a2_cleanup \
-      _a2_handle_signal _a2_init_fail _a2_restore_traps _a2_launch_job _a2_reap_job 2>/dev/null || true
+               _a2_handle_signal _a2_init_fail _a2_restore_traps _a2_launch_job _a2_reap_job 2>/dev/null || true
     else
       return 1
     fi
@@ -291,7 +279,13 @@ archivepar2 () {
     printf "%02d:%02d" $((sec / 60)) $((sec % 60))
   }
 
-  # Lançamento atômico com protocolo de handshake bidirecional (ACK), pré-validação estrita de PGID ativo e limpeza com espera limitada
+  _a2_print_log "=============================="
+  _a2_print_log "Archiving: $arch"
+  _a2_print_log "Working dir: $backup_dir"
+  _a2_print_log "Output base: $out"
+  _a2_print_log "=============================="
+
+  # Lançamento atômico blindado com set +m para supressão total de mensagens de controle de tarefas do shell
   _a2_launch_job() {
     local _a2_target_pid="$1"
     local _a2_target_pgid="$2"
@@ -301,19 +295,23 @@ archivepar2 () {
     _a2_pgid_file=$(mktemp "$fifo_dir/pgid_XXX.dat") || return 1
     _a2_ack_file=$(mktemp -u "$fifo_dir/ack_XXX.dat") || { rm -f "$_a2_pgid_file"; return 1; }
 
-    setsid -w bash -c '
-      echo "$BASHPID" > "$1" || exit 1
-      count=0
-      while [[ ! -f "$2" ]] && (( count < 100 )); do
-        sleep 0.01
-        (( ++count ))
-      done
-      [[ -f "$2" ]] || exit 1
-      rm -f "$2" 2>/dev/null || true
-      shift 2
-      exec "$@"
-    ' _ "$_a2_pgid_file" "$_a2_ack_file" "$@" &
-    local _a2_child_pid=$!
+    local _a2_child_pid
+    {
+      set +m
+      setsid -w bash -c '
+        echo "$BASHPID" > "$1" || exit 1
+        count=0
+        while [[ ! -f "$2" ]] && (( count < 100 )); do
+          sleep 0.01
+          (( ++count ))
+        done
+        [[ -f "$2" ]] || exit 1
+        rm -f "$2" 2>/dev/null || true
+        shift 2
+        exec "$@"
+      ' _ "$_a2_pgid_file" "$_a2_ack_file" "$@" &
+      _a2_child_pid=$!
+    } 2>/dev/null
 
     local _a2_captured_pgid=""
     local _a2_count=0
@@ -330,9 +328,6 @@ archivepar2 () {
     fi
     rm -f "$_a2_pgid_file" 2>/dev/null || true
 
-    # Validação estrita sem sanitização: o valor deve ser não-vazio, puramente numérico e pertencer a um grupo ativo.
-    # Defesa em profundidade: a checagem kill -0 mitiga (embora não elimine teoricamente o risco POSIX de TOCTOU)
-    # o disparo acidental de sinais para grupos reciclados.
     local _a2_g_active=0
     if [[ -n "$_a2_captured_pgid" ]] && [[ "$_a2_captured_pgid" =~ ^[0-9]+$ ]] && kill -0 -- -"${_a2_captured_pgid}" 2>/dev/null; then
       _a2_g_active=1
@@ -346,10 +341,6 @@ archivepar2 () {
     fi
 
     if (( _a2_launch_failed )); then
-      # Limpeza simétrica e com espera limitada para qualquer falha de lançamento:
-      # - Remove o arquivo ACK, impedindo que o processo interno chegue a executar o payload.
-      # - Envia SIGTERM ao wrapper child_pid e, somente se o grupo tiver sido previamente validado, ao grupo.
-      # - Executa espera limitada de até 20 iterações (1s) e escala para SIGKILL se necessário.
       rm -f "$_a2_ack_file" 2>/dev/null || true
       if (( _a2_g_active )) && kill -0 -- -"${_a2_captured_pgid}" 2>/dev/null; then
         kill -TERM -- -"${_a2_captured_pgid}" 2>/dev/null || true
@@ -375,9 +366,6 @@ archivepar2 () {
 
       wait "$_a2_child_pid" 2>/dev/null || true
 
-      # Confirmação pós-SIGKILL: verificar se o grupo também terminou.
-      # Se o PGID foi validado e o grupo ainda está ativo após o SIGKILL ao wrapper,
-      # aguardamos um intervalo limitado antes de registrar como órfão.
       if (( _a2_g_active )); then
         local _a2_conf_c=0
         while kill -0 -- -"${_a2_captured_pgid}" 2>/dev/null && (( _a2_conf_c < 10 )); do
@@ -385,10 +373,7 @@ archivepar2 () {
           (( ++_a2_conf_c ))
         done
         if kill -0 -- -"${_a2_captured_pgid}" 2>/dev/null; then
-          # Grupo ainda ativo após SIGKILL e período de tolerância.
-          # Registra o PGID para que _a2_cleanup possa tentar encerrar o grupo na limpeza geral.
           _a2_orphan_pgids+=("${_a2_captured_pgid}")
-          echo "WARNING: process group ${_a2_captured_pgid} may still be active after launch failure cleanup" >&2
         fi
       fi
       return 1
@@ -399,7 +384,6 @@ archivepar2 () {
     return 0
   }
 
-  # Helper estrito com separação de interrupção de wait e validação fail-closed
   _a2_reap_job() {
     local _a2_target_pid_var="$1"
     local _a2_target_pgid_var="$2"
@@ -424,17 +408,12 @@ archivepar2 () {
       else
         _a2_r_st=$?
         if (( _a2_r_st == 127 )); then
-          # Processo não é filho deste shell ou o status já foi perdido.
-          # Fail-closed: não é possível confirmar o recolhimento seguro.
           _a2_reap_confirmed=0
           break
         fi
 
-        # Distinção crítica: verificar se o processo ainda está vivo.
-        # Se _a2_r_pid ainda estiver em execução, o wait foi apenas interrompido por um sinal.
         if kill -0 "$_a2_r_pid" 2>/dev/null; then
           if (( abort_flag == 1 )); then
-            # Se a operação estiver em aborto, assegura que o sinal de término foi emitido ao grupo ativo
             if kill -0 -- -"${_a2_r_pgid}" 2>/dev/null; then
               kill -TERM -- -"${_a2_r_pgid}" 2>/dev/null || true
             fi
@@ -444,14 +423,11 @@ archivepar2 () {
           continue
         fi
 
-        # Processo _a2_r_pid terminou e não está mais ativo:
-        # _a2_r_st reflete o status final real obtido por wait (ex: código de saída ou 128+SIG).
         _a2_reap_confirmed=1
         break
       fi
     done
 
-    # Verificação e encerramento seguro de quaisquer processos remanescentes no grupo
     local _a2_g_count=0
     local _a2_forced_kill=0
     while kill -0 -- -"${_a2_r_pgid}" 2>/dev/null && (( _a2_g_count < 40 )); do
@@ -467,14 +443,10 @@ archivepar2 () {
         (( ++_a2_k_count ))
       done
       if kill -0 -- -"${_a2_r_pgid}" 2>/dev/null; then
-        # Grupo não encerrou nem após SIGKILL; falha grave no recolhimento
         _a2_reap_confirmed=0
       fi
     fi
 
-    # Se foi necessário recorrer a SIGKILL para exterminar processos remanescentes que não encerraram
-    # dentro do prazo de tolerância, isso representa uma falha operacional / anomalia no pipeline.
-    # Por consistência de contrato fail-closed, falha é retornada.
     if (( _a2_forced_kill )); then
       _a2_reap_confirmed=0
       (( _a2_r_st == 0 )) && _a2_r_st=1
@@ -951,10 +923,7 @@ archivepar2 () {
     par2_start=$(date +%s)
     _a2_print_log "[PAR2] Creating recovery files..."
 
-    local par2_cmd
-    par2_cmd=$(printf "par2 create -r10 %q " "${out}.par2"; printf "%q " "${parts[@]}"; printf "%q" "$manifest")
-    
-    if ! _a2_launch_job pid_par2 pgid_par2 bash -c 'script -q -f "$1" -c "$2"' _ "$par2_tty_file" "$par2_cmd"; then
+    if ! _a2_launch_job pid_par2 pgid_par2 par2 create -r10 "${out}.par2" "${parts[@]}" "$manifest"; then
       _a2_print_log "ERROR: Failed to launch PAR2 job."
       _a2_cleanup
       return 1
@@ -974,8 +943,6 @@ archivepar2 () {
       _a2_cleanup
       return 1
     fi
-
-    tr -d '\r' < "$par2_tty_file" | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
 
     par2_end=$(date +%s)
     t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
@@ -1118,7 +1085,7 @@ archivepar2 () {
     par2_start=$(date +%s)
     _a2_print_log "[PAR2] Creating recovery files..."
 
-    if ! _a2_launch_job pid_par2 pgid_par2 bash -c 'script -q -f "$1" -c '\''par2 create -r10 "'"${out}.par2"'" "'"${out}.tar.zst"'" "'"$manifest"'"'\''' _ "$par2_tty_file"; then
+    if ! _a2_launch_job pid_par2 pgid_par2 par2 create -r10 "${out}.par2" "${out}.tar.zst" "$manifest"; then
       _a2_print_log "ERROR: Failed to launch PAR2 job."
       _a2_cleanup
       return 1
@@ -1138,8 +1105,6 @@ archivepar2 () {
       _a2_cleanup
       return 1
     fi
-
-    tr -d '\r' < "$par2_tty_file" | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
 
     par2_end=$(date +%s)
     t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
