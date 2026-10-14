@@ -1,16 +1,6 @@
-# Version Details: v0.16.3.3.1b
-# Change: Migrated generation pipeline to staging. Compression, manifest,
-#         per-part hashing, TAR CHECK and PAR2 all run inside
-#         $backup_dir/.staging.<run_id>/. The active backup is untouched
-#         until _a2_commit_staging publishes via mv (rename on same FS).
-#         If anything fails before commit, the previous backup remains
-#         intact and the staging directory is removed.
-#         Added _a2_prune_obsolete_parts, called after successful commit
-#         in split mode to remove parts from the old archive that were
-#         not overwritten by the new one.
-#         _a2_commit_staging now moves files in explicit order:
-#         parts -> manifest -> par2.
-#         _a2_validate_global_manifest accepts an optional manifest path.
+# Version Details: v0.16.3.3.2a
+# Change: Versioned layout with atomic symlink swap; PAR2 resume path fix;
+#         --no-migrate keeps legacy commit.
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
     echo "Error: no input folder provided" >&2
@@ -28,6 +18,11 @@ archivepar2 () {
   local compress_status="SKIPPED" check_status="SKIPPED" par2_status="PENDING"
   local zstd_golden_line=""
 
+  local keep_versions=3
+  local keep_set=0
+  local no_migrate=0
+  local par2_done=0
+
   local _a2_orig_pipefail=0
   [[ -o pipefail ]] && _a2_orig_pipefail=1
   set -o pipefail
@@ -39,6 +34,17 @@ archivepar2 () {
     case "$current_arg" in
       --SINGLE) single_mode=1 ;;
       --FAST)    fast_mode=1 ;;
+      --NO-MIGRATE) no_migrate=1 ;;
+      --KEEP)
+        shift
+        if [[ -z "${1:-}" ]] || ! [[ "$1" =~ ^[0-9]+$ ]]; then
+          echo "ERROR: --keep requires a non-negative integer" >&2
+          (( _a2_orig_pipefail )) || set +o pipefail
+          return 1
+        fi
+        keep_versions="$1"
+        keep_set=1
+        ;;
       *)
         if [[ "$current_arg" =~ ^[1-9]+[0-9]*[KMGTP]$ ]]; then
           maxsize="$current_arg"
@@ -51,6 +57,10 @@ archivepar2 () {
     esac
     shift
   done
+
+  if (( ! keep_set )) && [[ -n "${ARCHIVEPAR2_KEEP:-}" ]] && [[ "$ARCHIVEPAR2_KEEP" =~ ^[0-9]+$ ]]; then
+    keep_versions="$ARCHIVEPAR2_KEEP"
+  fi
 
   _a2_init_fail() {
     (( _a2_orig_pipefail )) || set +o pipefail
@@ -223,7 +233,10 @@ archivepar2 () {
                _a2_detect_layout _a2_resolve_active_dir _a2_log_layout_diagnostics \
                _a2_check_same_filesystem _a2_acquire_lock _a2_release_lock \
                _a2_remove_orphan_stagings _a2_create_staging _a2_commit_staging \
-               _a2_cleanup_staging _a2_prune_obsolete_parts 2>/dev/null || true
+               _a2_cleanup_staging _a2_prune_obsolete_parts \
+               _a2_is_versioned_layout _a2_generate_version_name \
+               _a2_migrate_legacy_to_versioned _a2_commit_versioned \
+               _a2_prune_old_versions 2>/dev/null || true
     else
       return 1
     fi
@@ -296,21 +309,19 @@ archivepar2 () {
     return 1
   }
 
-  # ============================================================
-  # v0.16.3.2 — Lock variables
-  # ============================================================
   local lock_fd=9
   local lock_dir="$backup_dir/.archivepar2.lockdir"
   local lock_file="$backup_dir/.archivepar2.lock"
   local lock_acquired=0
   local lock_fs_type=""
 
-  # ============================================================
-  # v0.16.3.3.1a — Staging variables
-  # ============================================================
   local staging_dir=""
   local staging_committed=0
   local run_id="$$.$RANDOM.$(date +%s)"
+
+  local active_dir=""
+  local versioned_layout=0
+  local use_legacy_commit=0
 
   echo "==================================================" > "$logfile"
   echo "             ARCHIVEPAR2 SESSION LOG             " >> "$logfile"
@@ -319,13 +330,10 @@ archivepar2 () {
   echo "Source Path     : $arch" >> "$logfile"
   echo "Output Base Name: $out" >> "$logfile"
   echo "Target Directory: $backup_dir" >> "$logfile"
-  echo "Arguments Used  : Single Mode=$single_mode | Fast Mode=$fast_mode | Max Size=$maxsize" >> "$logfile"
-  echo "Version         : v0.16.3.3.1b" >> "$logfile"
+  echo "Arguments Used  : Single Mode=$single_mode | Fast Mode=$fast_mode | Max Size=$maxsize | Keep=$keep_versions | No-Migrate=$no_migrate" >> "$logfile"
+  echo "Version         : v0.16.3.3.2a" >> "$logfile"
   echo "--------------------------------------------------" >> "$logfile"
 
-  # ============================================================
-  # Logging helpers
-  # ============================================================
   _a2_print_log() {
     echo -e "$@" | tee -a "$logfile"
   }
@@ -335,47 +343,32 @@ archivepar2 () {
     printf "%02d:%02d" $((sec / 60)) $((sec % 60))
   }
 
-  # ============================================================
-  # v0.16.3.1 — Layout detection and diagnostics
-  # ============================================================
   _a2_detect_layout() {
     local target="$1"
-
     if [[ -L "$target/current" ]]; then
-      echo "versioned"
-      return 0
+      echo "versioned"; return 0
     fi
     if compgen -G "$target/v[0-9]*-[0-9]*" > /dev/null; then
-      echo "versioned"
-      return 0
+      echo "versioned"; return 0
     fi
-
     if compgen -G "$target/${out}.tar.zst.part-*" > /dev/null; then
-      echo "legacy"
-      return 0
+      echo "legacy"; return 0
     fi
     if [[ -f "$target/${out}.tar.zst" ]] || [[ -f "$target/${out}.blake3" ]]; then
-      echo "legacy"
-      return 0
+      echo "legacy"; return 0
     fi
-
-    echo "empty"
-    return 0
+    echo "empty"; return 0
   }
 
   _a2_resolve_active_dir() {
     local target="$1"
     local layout
     layout=$(_a2_detect_layout "$target")
-
     case "$layout" in
       versioned)
         if [[ -L "$target/current" ]]; then
           local resolved
-          resolved=$(realpath "$target/current" 2>/dev/null) || {
-            echo "$target"
-            return 0
-          }
+          resolved=$(realpath "$target/current" 2>/dev/null) || { echo "$target"; return 0; }
           echo "$resolved"
         else
           local latest=""
@@ -383,16 +376,10 @@ archivepar2 () {
           while IFS= read -r v; do
             [[ -n "$v" ]] && latest="$v"
           done < <(ls -1d "$target"/v[0-9]*-[0-9]* 2>/dev/null | sort)
-          if [[ -n "$latest" ]]; then
-            echo "$latest"
-          else
-            echo "$target"
-          fi
+          if [[ -n "$latest" ]]; then echo "$latest"; else echo "$target"; fi
         fi
         ;;
-      legacy|empty|*)
-        echo "$target"
-        ;;
+      legacy|empty|*) echo "$target" ;;
     esac
   }
 
@@ -401,10 +388,8 @@ archivepar2 () {
     local layout active
     layout=$(_a2_detect_layout "$target")
     active=$(_a2_resolve_active_dir "$target")
-
     _a2_print_log "[LAYOUT] Detected layout: $layout"
     _a2_print_log "[LAYOUT] Active dir     : $active"
-
     if [[ "$layout" == "versioned" ]]; then
       if [[ -L "$target/current" ]]; then
         local link_target
@@ -413,7 +398,6 @@ archivepar2 () {
       else
         _a2_print_log "[LAYOUT] No 'current' symlink present; using latest v* dir"
       fi
-
       local -a versions=()
       local v
       while IFS= read -r v; do
@@ -431,26 +415,19 @@ archivepar2 () {
   _a2_check_same_filesystem() {
     local path_a="$1"
     local path_b="$2"
-
     local dev_a dev_b
     dev_a=$(stat -c %d "$path_a" 2>/dev/null) || return 0
     dev_b=$(stat -c %d "$path_b" 2>/dev/null) || return 0
-
     [[ -n "$dev_a" ]] && [[ -n "$dev_b" ]] && [[ "$dev_a" == "$dev_b" ]]
   }
 
-  # ============================================================
-  # v0.16.3.3.1a — Staging infrastructure
-  # ============================================================
   _a2_remove_orphan_stagings() {
     local target="$1"
     local orig_nullglob=0
     [[ -o nullglob ]] && orig_nullglob=1
     shopt -s nullglob
-
     local -a orphans=( "$target"/.staging.* )
     (( orig_nullglob )) || shopt -u nullglob
-
     local o
     for o in "${orphans[@]}"; do
       [[ -d "$o" ]] || continue
@@ -472,12 +449,10 @@ archivepar2 () {
   _a2_create_staging() {
     local target="$1"
     staging_dir="$target/.staging.${run_id}"
-
     if ! mkdir "$staging_dir" 2>/dev/null; then
       _a2_print_log "[STAGING] ERROR: cannot create staging directory '$staging_dir'"
       return 1
     fi
-
     if ! _a2_check_same_filesystem "$staging_dir" "$target"; then
       _a2_print_log "[STAGING] ERROR: staging and backup are on different filesystems"
       _a2_print_log "[STAGING]         staging: $staging_dir"
@@ -487,72 +462,7 @@ archivepar2 () {
       staging_dir=""
       return 1
     fi
-
     _a2_print_log "[STAGING] Created staging directory: $(basename "$staging_dir")"
-    return 0
-  }
-
-  _a2_commit_staging() {
-    local staging="$1"
-    local target="$2"
-
-    [[ -d "$staging" ]] || {
-      _a2_print_log "[COMMIT] ERROR: staging directory does not exist: $staging"
-      return 1
-    }
-
-    _a2_print_log "[COMMIT] Publishing staging to $target..."
-
-    local orig_nullglob=0
-    [[ -o nullglob ]] && orig_nullglob=1
-    shopt -s nullglob
-
-    # Order: parts -> manifest -> par2. Internal files (like .status)
-    # are intentionally NOT published.
-    local -a part_files=( "$staging"/*.tar.zst.part-* )
-    local -a manifest_files=( "$staging"/*.blake3 )
-    local -a par2_files=( "$staging"/*.par2 "$staging"/*.vol*.par2 )
-
-    local moved=0
-    local f base
-
-    for f in "${part_files[@]}"; do
-      [[ -e "$f" ]] || continue
-      base=$(basename "$f")
-      mv -f "$f" "$target/$base" 2>/dev/null || {
-        _a2_print_log "[COMMIT] ERROR: failed to publish part '$base'"
-        (( orig_nullglob )) || shopt -u nullglob
-        return 1
-      }
-      (( ++moved ))
-    done
-
-    for f in "${manifest_files[@]}"; do
-      [[ -e "$f" ]] || continue
-      base=$(basename "$f")
-      mv -f "$f" "$target/$base" 2>/dev/null || {
-        _a2_print_log "[COMMIT] ERROR: failed to publish manifest '$base'"
-        (( orig_nullglob )) || shopt -u nullglob
-        return 1
-      }
-      (( ++moved ))
-    done
-
-    for f in "${par2_files[@]}"; do
-      [[ -e "$f" ]] || continue
-      base=$(basename "$f")
-      mv -f "$f" "$target/$base" 2>/dev/null || {
-        _a2_print_log "[COMMIT] ERROR: failed to publish par2 '$base'"
-        (( orig_nullglob )) || shopt -u nullglob
-        return 1
-      }
-      (( ++moved ))
-    done
-
-    (( orig_nullglob )) || shopt -u nullglob
-
-    _a2_print_log "[COMMIT] Published $moved file(s)."
-    staging_committed=1
     return 0
   }
 
@@ -569,74 +479,175 @@ archivepar2 () {
     return 0
   }
 
-  # ============================================================
-  # v0.16.3.3.1b — Prune obsolete parts after commit
-  # ============================================================
-  #
-  # Removes parts in $target that are NOT referenced by the new
-  # manifest (which is now in $target after a successful commit).
-  # Called only in split mode, after _a2_commit_staging succeeded.
-  #
-  _a2_prune_obsolete_parts() {
+  _a2_is_versioned_layout() {
     local target="$1"
-    local manifest_name="${out}.blake3"
+    [[ -L "$target/current" ]] || compgen -G "$target/v[0-9]*-[0-9]*" > /dev/null
+  }
 
-    [[ -f "$target/$manifest_name" ]] || {
-      _a2_print_log "[PRUNE] WARN: manifest not found in $target; skipping obsolete-part prune"
-      return 0
-    }
-
-    # Collect the basenames of parts referenced by the new manifest.
-    local -A expected=()
-    local line name
-    while IFS= read -r line; do
-      [[ "$line" =~ ^[[:space:]]*# ]] && continue
-      [[ -z "${line// }" ]] && continue
-      name="${line##*[[:space:]]}"
-      name="${name##*/}"
-      [[ "$name" == *".tar.zst.part-"* ]] || continue
-      expected["$name"]=1
-    done < "$target/$manifest_name"
-
-    local orig_nullglob=0
-    [[ -o nullglob ]] && orig_nullglob=1
-    shopt -s nullglob
-
-    local -a existing=( "$target"/${out}.tar.zst.part-* )
-    (( orig_nullglob )) || shopt -u nullglob
-
-    local f base
-    local removed=0
-    for f in "${existing[@]}"; do
-      [[ -e "$f" ]] || continue
-      base=$(basename "$f")
-      if [[ -z "${expected[$base]:-}" ]]; then
-        if rm -f "$f" 2>/dev/null; then
-          (( ++removed ))
-          _a2_print_log "[PRUNE] Removed obsolete part: $base"
-        else
-          _a2_print_log "[PRUNE] WARN: could not remove obsolete part: $base"
-        fi
+  _a2_generate_version_name() {
+    local base_name
+    base_name="v$(date '+%Y%m%d-%H%M%S')"
+    local candidate="$base_name"
+    local suffix=1
+    while [[ -e "$backup_dir/$candidate" ]]; do
+      candidate="${base_name}-${suffix}"
+      (( ++suffix ))
+      if (( suffix > 999 )); then
+        _a2_print_log "[VERSION] ERROR: could not generate unique version name after 999 attempts"
+        return 1
       fi
     done
-
-    (( removed > 0 )) && _a2_print_log "[PRUNE] Removed $removed obsolete part(s)."
+    echo "$candidate"
     return 0
   }
 
-  # ============================================================
-  # v0.16.3.2 / v0.16.3.2b — Layered locking
-  # ============================================================
-  _a2_acquire_lock() {
+  _a2_migrate_legacy_to_versioned() {
     local target="$1"
+    local layout
+    layout=$(_a2_detect_layout "$target")
+    if [[ "$layout" != "legacy" ]]; then
+      return 0
+    fi
+    if (( no_migrate )); then
+      _a2_print_log "[MIGRATE] Legacy layout detected but --no-migrate was given; keeping legacy"
+      return 0
+    fi
+    local orig_nullglob=0
+    [[ -o nullglob ]] && orig_nullglob=1
+    shopt -s nullglob
+    local -a legacy_files=(
+      "$target"/${out}.tar.zst.part-*
+      "$target"/${out}.tar.zst
+      "$target"/${out}.blake3
+      "$target"/${out}.par2
+      "$target"/${out}.vol*.par2
+    )
+    (( orig_nullglob )) || shopt -u nullglob
+    if (( ${#legacy_files[@]} == 0 )); then
+      return 0
+    fi
+    local version_name
+    version_name=$(_a2_generate_version_name) || return 1
+    local version_dir="$target/$version_name"
+    _a2_print_log "[MIGRATE] Migrating legacy layout to versioned: $version_name"
+    if ! mkdir "$version_dir" 2>/dev/null; then
+      _a2_print_log "[MIGRATE] ERROR: cannot create version directory '$version_dir'"
+      return 1
+    fi
+    local f base moved=0
+    for f in "${legacy_files[@]}"; do
+      [[ -e "$f" ]] || continue
+      base=$(basename "$f")
+      if ! mv -f "$f" "$version_dir/$base" 2>/dev/null; then
+        _a2_print_log "[MIGRATE] ERROR: failed to move '$base' to $version_name"
+        local g gbase
+        for g in "$version_dir"/*; do
+          [[ -e "$g" ]] || continue
+          gbase=$(basename "$g")
+          mv -f "$g" "$target/$gbase" 2>/dev/null || true
+        done
+        rmdir "$version_dir" 2>/dev/null || true
+        return 1
+      fi
+      (( ++moved ))
+    done
+    _a2_print_log "[MIGRATE] Moved $moved file(s) to $version_name"
+    if ! ln -sfn "$version_name" "$target/current.tmp" 2>/dev/null; then
+      _a2_print_log "[MIGRATE] ERROR: cannot create symlink current.tmp"
+      return 1
+    fi
+    if ! mv -T "$target/current.tmp" "$target/current" 2>/dev/null; then
+      _a2_print_log "[MIGRATE] ERROR: cannot rename current.tmp to current"
+      rm -f "$target/current.tmp" 2>/dev/null || true
+      return 1
+    fi
+    _a2_print_log "[MIGRATE] Migration complete; current -> $version_name"
+    return 0
+  }
 
+  _a2_commit_versioned() {
+    local staging="$1"
+    local target="$2"
+    [[ -d "$staging" ]] || {
+      _a2_print_log "[COMMIT] ERROR: staging directory does not exist: $staging"
+      return 1
+    }
+    local version_name
+    version_name=$(_a2_generate_version_name) || return 1
+    local version_dir="$target/$version_name"
+    _a2_print_log "[COMMIT] Publishing staging as version: $version_name"
+    if ! mv "$staging" "$version_dir" 2>/dev/null; then
+      _a2_print_log "[COMMIT] ERROR: failed to rename staging to $version_name"
+      return 1
+    fi
+    if ! ln -sfn "$version_name" "$target/current.tmp" 2>/dev/null; then
+      _a2_print_log "[COMMIT] ERROR: cannot create current.tmp symlink"
+      mv "$version_dir" "$staging" 2>/dev/null || true
+      return 1
+    fi
+    if ! mv -T "$target/current.tmp" "$target/current" 2>/dev/null; then
+      _a2_print_log "[COMMIT] ERROR: cannot rename current.tmp to current"
+      rm -f "$target/current.tmp" 2>/dev/null || true
+      mv "$version_dir" "$staging" 2>/dev/null || true
+      return 1
+    fi
+    _a2_print_log "[COMMIT] Version $version_name is now active"
+    staging_committed=1
+    return 0
+  }
+
+  _a2_prune_old_versions() {
+    local target="$1"
+    local keep="$2"
+    local orig_nullglob=0
+    [[ -o nullglob ]] && orig_nullglob=1
+    shopt -s nullglob
+    local -a versions=( "$target"/v[0-9]*-[0-9]* )
+    (( orig_nullglob )) || shopt -u nullglob
+    if (( ${#versions[@]} == 0 )); then
+      return 0
+    fi
+    local -a sorted
+    mapfile -t sorted < <(printf '%s\n' "${versions[@]}" | sort)
+    local active_target=""
+    if [[ -L "$target/current" ]]; then
+      active_target=$(readlink "$target/current" 2>/dev/null)
+    fi
+    local total=${#sorted[@]}
+    local to_keep=$((keep + 1))
+    if (( total <= to_keep )); then
+      return 0
+    fi
+    local to_remove=$((total - to_keep))
+    local removed=0
+    local v vbase
+    for v in "${sorted[@]}"; do
+      (( to_remove == 0 )) && break
+      [[ -d "$v" ]] || continue
+      vbase=$(basename "$v")
+      if [[ "$vbase" == "$active_target" ]]; then
+        continue
+      fi
+      if rm -rf "$v" 2>/dev/null; then
+        _a2_print_log "[PRUNE] Removed old version: $vbase"
+        (( ++removed ))
+        (( --to_remove ))
+      else
+        _a2_print_log "[PRUNE] WARN: could not remove old version: $vbase"
+      fi
+    done
+    (( removed > 0 )) && _a2_print_log "[PRUNE] Removed $removed old version(s)."
+    return 0
+  }
+
+    _a2_acquire_lock() {
+    local target="$1"
     lock_fs_type=$(stat -f -c %T "$target" 2>/dev/null || echo "unknown")
     case "$lock_fs_type" in
       sshfs|fuse*|cifs|smb*|9p)
         _a2_print_log "[LOCK] WARN: filesystem '$lock_fs_type' may not support reliable locking"
         ;;
     esac
-
     if command -v flock >/dev/null 2>&1; then
       exec {lock_fd}>"$lock_file" || {
         _a2_print_log "[LOCK] ERROR: cannot open lock file '$lock_file'"
@@ -649,7 +660,6 @@ archivepar2 () {
           holder_time=$(cat "$lock_dir/time" 2>/dev/null)
           holder_cmd=$(cat "$lock_dir/cmd" 2>/dev/null)
         fi
-
         _a2_print_log "[LOCK] ERROR: another archivepar2 instance holds the lock on $target"
         _a2_print_log "[LOCK]   PID     : ${holder_pid:-?}"
         [[ -n "$holder_time" ]] && _a2_print_log "[LOCK]   Started : $holder_time"
@@ -659,13 +669,11 @@ archivepar2 () {
         return 1
       fi
     fi
-
     if ! mkdir "$lock_dir" 2>/dev/null; then
       local holder_pid holder_time holder_cmd holder_alive=0
       holder_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
       holder_time=$(cat "$lock_dir/time" 2>/dev/null || echo "")
       holder_cmd=$(cat "$lock_dir/cmd" 2>/dev/null || echo "")
-
       if [[ -n "$holder_pid" ]] && [[ "$holder_pid" =~ ^[0-9]+$ ]]; then
         if kill -0 "$holder_pid" 2>/dev/null; then
           local cmdline=""
@@ -679,7 +687,6 @@ archivepar2 () {
           fi
         fi
       fi
-
       if (( holder_alive )); then
         _a2_print_log "[LOCK] ERROR: another archivepar2 instance holds the lock on $target"
         _a2_print_log "[LOCK]   PID     : ${holder_pid:-?}"
@@ -691,7 +698,6 @@ archivepar2 () {
         fi
         return 1
       fi
-
       _a2_print_log "[LOCK] WARN: stale lockdir detected (PID ${holder_pid:-unknown} not an active archivepar2). Removing."
       rm -rf "$lock_dir" 2>/dev/null || {
         _a2_print_log "[LOCK] ERROR: cannot remove stale lockdir '$lock_dir'"
@@ -708,7 +714,6 @@ archivepar2 () {
         return 1
       fi
     fi
-
     echo "$BASHPID" > "$lock_dir/pid" 2>/dev/null || true
     date '+%Y-%m-%d %H:%M:%S' > "$lock_dir/time" 2>/dev/null || true
     if [[ -r "/proc/$BASHPID/cmdline" ]]; then
@@ -716,7 +721,6 @@ archivepar2 () {
     else
       ps -p "$BASHPID" -o args= > "$lock_dir/cmd" 2>/dev/null || echo "archivepar2" > "$lock_dir/cmd"
     fi
-
     lock_acquired=1
     _a2_print_log "[LOCK] Acquired lock on $target (PID $BASHPID, fs=$lock_fs_type)"
     return 0
@@ -724,7 +728,6 @@ archivepar2 () {
 
   _a2_release_lock() {
     (( lock_acquired )) || return 0
-
     if [[ -d "$lock_dir" ]]; then
       local owner_pid=""
       owner_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
@@ -732,36 +735,39 @@ archivepar2 () {
         rm -rf "$lock_dir" 2>/dev/null || true
       fi
     fi
-
-    # Release flock (closing the fd makes the kernel release the lock).
-    #
-    # IMPORTANT: We deliberately do NOT unlink $lock_file here.
-    #
-    # Rationale: flock's lock is associated with the file descriptor,
-    # not the directory entry. If we unlink the file while another
-    # process still holds an fd to the same inode (opened before our
-    # unlink), and a third process creates a new file at the same path
-    # (new inode), the second and third processes would hold locks on
-    # different inodes and would NOT block each other.
-    #
-    # Keeping the file in place ensures all invocations for this
-    # backup_dir use the same inode. The file is 0 bytes and is
-    # filtered out of the parts glob by its leading dot.
-    #
-    # v0.16.3.3.3 will relocate this file to $XDG_RUNTIME_DIR to
-    # eliminate the visual clutter without reintroducing the race.
     if command -v flock >/dev/null 2>&1; then
       exec {lock_fd}>&- 2>/dev/null || true
     fi
-
     lock_acquired=0
   }
 
-  # Acquire lock before any heavy work.
   if ! _a2_acquire_lock "$backup_dir"; then
     _a2_cleanup
     return 1
   fi
+
+  if ! _a2_migrate_legacy_to_versioned "$backup_dir"; then
+    _a2_print_log "ERROR: migration failed"
+    _a2_cleanup
+    return 1
+  fi
+
+  active_dir="$(_a2_resolve_active_dir "$backup_dir")"
+  if _a2_is_versioned_layout "$backup_dir"; then
+    versioned_layout=1
+  fi
+
+  if (( versioned_layout )); then
+    use_legacy_commit=0
+  elif (( no_migrate )); then
+    use_legacy_commit=1
+  else
+    use_legacy_commit=0
+  fi
+
+  _a2_print_log "[LAYOUT] Active dir (resolved): $active_dir"
+  _a2_print_log "[LAYOUT] Versioned mode       : $versioned_layout"
+  _a2_print_log "[LAYOUT] Commit strategy      : $([[ $use_legacy_commit -eq 1 ]] && echo 'legacy (files in backup_dir)' || echo 'versioned (v<timestamp> + symlink)')"
 
   _a2_remove_orphan_stagings "$backup_dir"
 
@@ -783,11 +789,9 @@ archivepar2 () {
     local _a2_target_pid="$1"
     local _a2_target_pgid="$2"
     shift 2
-
     local _a2_pgid_file _a2_ack_file
     _a2_pgid_file=$(mktemp "$fifo_dir/pgid_XXX.dat") || return 1
     _a2_ack_file=$(mktemp -u "$fifo_dir/ack_XXX.dat") || { rm -f "$_a2_pgid_file"; return 1; }
-
     {
       set +m
       setsid -w bash -c '
@@ -804,7 +808,6 @@ archivepar2 () {
       ' _ "$_a2_pgid_file" "$_a2_ack_file" "$@" &
       local _a2_child_pid=$!
     } 2>/dev/null
-
     local _a2_captured_pgid=""
     local _a2_count=0
     while [[ ! -s "$_a2_pgid_file" ]] && (( _a2_count < 100 )); do
@@ -814,31 +817,26 @@ archivepar2 () {
       sleep 0.01
       (( ++_a2_count ))
     done
-
     if [[ -s "$_a2_pgid_file" ]]; then
       _a2_captured_pgid=$(< "$_a2_pgid_file")
     fi
     rm -f "$_a2_pgid_file" 2>/dev/null || true
-
     local _a2_g_active=0
     if [[ -n "$_a2_captured_pgid" ]] && [[ "$_a2_captured_pgid" =~ ^[0-9]+$ ]] && kill -0 -- -"${_a2_captured_pgid}" 2>/dev/null; then
       _a2_g_active=1
     fi
-
     local _a2_launch_failed=0
     if (( _a2_g_active == 0 )) || (( abort_flag == 1 )); then
       _a2_launch_failed=1
     elif ! touch "$_a2_ack_file" 2>/dev/null; then
       _a2_launch_failed=1
     fi
-
     if (( _a2_launch_failed )); then
       rm -f "$_a2_ack_file" 2>/dev/null || true
       if (( _a2_g_active )) && kill -0 -- -"${_a2_captured_pgid}" 2>/dev/null; then
         kill -TERM -- -"${_a2_captured_pgid}" 2>/dev/null || true
       fi
       kill -TERM "$_a2_child_pid" 2>/dev/null || true
-
       local _a2_sub_c=0
       while (( _a2_sub_c < 20 )); do
         local _a2_alive=0
@@ -848,16 +846,13 @@ archivepar2 () {
         sleep 0.05
         (( ++_a2_sub_c ))
       done
-
       if kill -0 "$_a2_child_pid" 2>/dev/null; then
         kill -KILL "$_a2_child_pid" 2>/dev/null || true
       fi
       if (( _a2_g_active )) && kill -0 -- -"${_a2_captured_pgid}" 2>/dev/null; then
         kill -KILL -- -"${_a2_captured_pgid}" 2>/dev/null || true
       fi
-
       wait "$_a2_child_pid" 2>/dev/null || true
-
       if (( _a2_g_active )); then
         local _a2_conf_c=0
         while kill -0 -- -"${_a2_captured_pgid}" 2>/dev/null && (( _a2_conf_c < 10 )); do
@@ -870,7 +865,6 @@ archivepar2 () {
       fi
       return 1
     fi
-
     eval "$_a2_target_pid=$_a2_child_pid"
     eval "$_a2_target_pgid=$_a2_captured_pgid"
     return 0
@@ -880,18 +874,15 @@ archivepar2 () {
     local _a2_target_pid_var="$1"
     local _a2_target_pgid_var="$2"
     local _a2_status_var_name="$3"
-
     local _a2_r_pid="${!_a2_target_pid_var}"
     local _a2_r_pgid="${!_a2_target_pgid_var}"
     local _a2_r_st=1
     local _a2_retry_count=0
     local _a2_reap_confirmed=0
-
     if [[ -z "$_a2_r_pid" ]] || ! [[ "$_a2_r_pid" =~ ^[0-9]+$ ]] || [[ -z "$_a2_r_pgid" ]] || ! [[ "$_a2_r_pgid" =~ ^[0-9]+$ ]]; then
       eval "$_a2_status_var_name=1"
       return 1
     fi
-
     while (( _a2_retry_count < 100 )); do
       if wait "$_a2_r_pid" 2>/dev/null; then
         _a2_r_st=0
@@ -903,7 +894,6 @@ archivepar2 () {
           _a2_reap_confirmed=0
           break
         fi
-
         if kill -0 "$_a2_r_pid" 2>/dev/null; then
           if (( abort_flag == 1 )); then
             if kill -0 -- -"${_a2_r_pgid}" 2>/dev/null; then
@@ -914,12 +904,10 @@ archivepar2 () {
           sleep 0.05
           continue
         fi
-
         _a2_reap_confirmed=1
         break
       fi
     done
-
     local _a2_g_count=0
     local _a2_forced_kill=0
     while kill -0 -- -"${_a2_r_pgid}" 2>/dev/null && (( _a2_g_count < 40 )); do
@@ -938,14 +926,11 @@ archivepar2 () {
         _a2_reap_confirmed=0
       fi
     fi
-
     if (( _a2_forced_kill )); then
       _a2_reap_confirmed=0
       (( _a2_r_st == 0 )) && _a2_r_st=1
     fi
-
     eval "$_a2_status_var_name=$_a2_r_st"
-
     if (( _a2_reap_confirmed )); then
       eval "$_a2_target_pid_var=\"\""
       eval "$_a2_target_pgid_var=\"\""
@@ -957,27 +942,23 @@ archivepar2 () {
 
   _a2_check_content_integrity() {
     (( abort_flag )) && return 1
-
     if (( fast_mode )); then
       check_status="PASSED (FAST MODE)"
       return 0
     fi
-
     local chk_start chk_end
     chk_start=$(date +%s)
-
     _a2_print_log "=============================="
     _a2_print_log "[TAR CHECK] Checking content integrity against origin..."
-
     (( abort_flag )) && return 1
-
-    # Determine where the archive parts live: staging if it exists
-    # (fresh generation), else $backup_dir (resume validation).
-    local where="$backup_dir"
+    local where=""
     if [[ -n "$staging_dir" ]] && [[ -d "$staging_dir" ]]; then
       where="$staging_dir"
+    elif [[ -n "$active_dir" ]] && [[ -d "$active_dir" ]]; then
+      where="$active_dir"
+    else
+      where="$backup_dir"
     fi
-
     local status=0
     if (( single_mode )); then
         _a2_launch_job pid_check pgid_check bash -c '
@@ -996,7 +977,6 @@ archivepar2 () {
           check_status="FAILED"
           return 1
         fi
-
         _a2_launch_job pid_check pgid_check bash -c '
           set -o pipefail
           cd "$1" || exit 1
@@ -1004,24 +984,19 @@ archivepar2 () {
           cat "$@" | zstd -dc --progress | tar --diff -f -
         ' _ "$parent_dir" "${abs_parts[@]}"
     fi
-
     if (( $? != 0 )); then
       _a2_print_log "ERROR: Failed to launch integrity check job."
       check_status="FAILED"
       return 1
     fi
-
     if ! _a2_reap_job pid_check pgid_check status; then
       _a2_print_log "ERROR: Could not reliably reap integrity check job."
       check_status="FAILED"
       return 1
     fi
-
     chk_end=$(date +%s)
     t_check_dur=$(_a2_format_duration $((chk_end - chk_start)))
-
     (( abort_flag )) && return 1
-
     if [ $status -eq 0 ]; then
         _a2_print_log "[TAR CHECK] Content Successfully Validated (100% Identical)."
         _a2_print_log "=============================="
@@ -1038,18 +1013,17 @@ archivepar2 () {
     if [[ -z "$where" ]]; then
       if [[ -n "$staging_dir" ]] && [[ -d "$staging_dir" ]]; then
         where="$staging_dir"
+      elif [[ -n "$active_dir" ]] && [[ -d "$active_dir" ]]; then
+        where="$active_dir"
       else
         where="$backup_dir"
       fi
     fi
-
     local orig_nullglob=0
     [[ -o nullglob ]] && orig_nullglob=1
     shopt -s nullglob
-
     local -a raw=( "$where"/${out}.tar.zst.part-* )
     (( orig_nullglob )) || shopt -u nullglob
-
     parts=()
     local f
     for f in "${raw[@]}"; do
@@ -1059,16 +1033,17 @@ archivepar2 () {
   }
 
   _a2_show_manifest() {
-    [[ -f "$manifest" ]] || return
+    local m_file="${1:-$manifest}"
+    [[ -f "$m_file" ]] || return
     _a2_print_log "[BLAKE3 MANIFEST CONTENT]"
-    cat "$manifest" >> "$logfile"
-    cat "$manifest"
+    cat "$m_file" >> "$logfile"
+    cat "$m_file"
   }
 
   _a2_verify_manifest_single() {
     local stored current
-    [[ -f "$manifest" ]] || return 10
-
+    local active_manifest="$active_dir/${out}.blake3"
+    [[ -f "$active_manifest" ]] || return 10
     stored=$(awk -v target="${out}.tar.zst" '
       BEGIN { count = 0; malformed_pos = 0; invalid = 0; valid_hash = "" }
       $0 ~ /^#/ { next }
@@ -1094,9 +1069,8 @@ archivepar2 () {
         print valid_hash;
         exit 0;
       }
-    ' "$manifest")
+    ' "$active_manifest")
     local awk_status=$?
-    
     if (( awk_status == 10 )); then
       return 10
     elif (( awk_status == 11 )); then
@@ -1107,30 +1081,25 @@ archivepar2 () {
       return 4
     fi
     [[ -z "$stored" ]] && return 10
-
     : > "$resume_out_file"
     if ! _a2_launch_job pid_resume pgid_resume bash -c '
       set -o pipefail
       b3sum "$1" | awk '\''{print $1}'\'' > "$2"
-    ' _ "${out}.tar.zst" "$resume_out_file"; then
+    ' _ "$active_dir/${out}.tar.zst" "$resume_out_file"; then
       _a2_print_log "ERROR: Failed to launch resume hash job."
       return 4
     fi
-
     local resume_wait_status=0
     if ! _a2_reap_job pid_resume pgid_resume resume_wait_status; then
       _a2_print_log "ERROR: Could not reliably reap resume hash job."
       return 4
     fi
-
     if (( resume_wait_status != 0 )) || ! [[ -f "$resume_out_file" ]]; then
       _a2_print_log "ERROR: Failed to compute hash for existing archive during resume."
       return 4
     fi
-
     current=$(< "$resume_out_file")
     [[ -n "$current" ]] || return 4
-
     _a2_print_log "[BLAKE3] Stored Global : $stored"
     _a2_print_log "[BLAKE3] Current Stream: $current"
     [[ "$stored" == "$current" ]]
@@ -1138,8 +1107,8 @@ archivepar2 () {
 
   _a2_verify_manifest_split() {
     local stored current
-    [[ -f "$manifest" ]] || return 10
-
+    local active_manifest="$active_dir/${out}.blake3"
+    [[ -f "$active_manifest" ]] || return 10
     stored=$(awk -v target="${out}.tar.zst" '
       BEGIN { count = 0; malformed_pos = 0; invalid = 0; valid_hash = "" }
       $0 ~ /^#/ { next }
@@ -1165,9 +1134,8 @@ archivepar2 () {
         print valid_hash;
         exit 0;
       }
-    ' "$manifest")
+    ' "$active_manifest")
     local awk_status=$?
-
     if (( awk_status == 10 )); then
       return 10
     elif (( awk_status == 11 )); then
@@ -1178,7 +1146,6 @@ archivepar2 () {
       return 4
     fi
     [[ -z "$stored" ]] && return 10
-
     : > "$resume_out_file"
     if command -v pv >/dev/null 2>&1; then
       if ! _a2_launch_job pid_resume pgid_resume bash -c '
@@ -1186,7 +1153,7 @@ archivepar2 () {
         out_file="${@: -1}"
         parts_list=("${@:1:$#-1}")
         cat -- "${parts_list[@]}" | pv -N "Validating Split Files" -p -t -e -r -b | b3sum | awk '\''{print $1}'\'' > "$out_file"
-      ' _ "${parts[@]}" "$resume_out_file"; then
+      ' _ "${parts[@]/#/$active_dir/}" "$resume_out_file"; then
         _a2_print_log "ERROR: Failed to launch split resume hash job."
         return 4
       fi
@@ -1196,26 +1163,22 @@ archivepar2 () {
         out_file="${@: -1}"
         parts_list=("${@:1:$#-1}")
         cat -- "${parts_list[@]}" | b3sum | awk '\''{print $1}'\'' > "$out_file"
-      ' _ "${parts[@]}" "$resume_out_file"; then
+      ' _ "${parts[@]/#/$active_dir/}" "$resume_out_file"; then
         _a2_print_log "ERROR: Failed to launch split resume hash job."
         return 4
       fi
     fi
-
     local resume_wait_status=0
     if ! _a2_reap_job pid_resume pgid_resume resume_wait_status; then
       _a2_print_log "ERROR: Could not reliably reap split resume hash job."
       return 4
     fi
-
     if (( resume_wait_status != 0 )) || ! [[ -f "$resume_out_file" ]]; then
       _a2_print_log "ERROR: Failed to read/compute hash of split parts during resume."
       return 4
     fi
-
     current=$(< "$resume_out_file")
     [[ -n "$current" ]] || return 4
-
     _a2_print_log "[BLAKE3] Stored Global : $stored"
     _a2_print_log "[BLAKE3] Current Stream: $current"
     [[ "$stored" == "$current" ]]
@@ -1224,9 +1187,7 @@ archivepar2 () {
   _a2_validate_global_manifest() {
     local m_file="${1:-$manifest}"
     local target_name="${out}.tar.zst"
-
     [[ -f "$m_file" ]] || return 1
-
     awk -v target="$target_name" '
       BEGIN { count = 0; malformed_pos = 0; invalid = 0 }
       $0 ~ /^#/ { next }
@@ -1250,9 +1211,7 @@ archivepar2 () {
     ' "$m_file"
   }
 
-  # ------------------------------------------------------------
-  # EXECUÇÃO DO FLUXO (SPLIT MODE OU SINGLE MODE)
-  # ------------------------------------------------------------
+  # ==================== FLUXO PRINCIPAL ====================
   local run_compression=1
   local comp_start comp_end
   local response
@@ -1267,7 +1226,6 @@ archivepar2 () {
     # ==================== MODO SPLIT ====================
     _a2_print_log "[MODE] Split mode ($maxsize)"
     _a2_update_parts_array
-
     (( abort_flag )) && { _a2_cleanup; return 1; }
 
     if [[ ${#parts[@]} -gt 0 ]]; then
@@ -1278,7 +1236,7 @@ archivepar2 () {
         _a2_print_log "[BLAKE3] Manifest OK"
         if _a2_check_content_integrity; then
           _a2_print_log "[RESUME] Existing parts are healthy! Skipping compression stage."
-          _a2_show_manifest
+          _a2_show_manifest "$active_dir/${out}.blake3"
           run_compression=0
         fi
       elif (( v_status == 10 )); then
@@ -1296,7 +1254,6 @@ archivepar2 () {
         return 1
       fi
     fi
-
     (( abort_flag )) && { _a2_cleanup; return 1; }
 
     if (( run_compression )); then
@@ -1305,10 +1262,8 @@ archivepar2 () {
         _a2_cleanup
         return 1
       fi
-
       local staging_manifest="$staging_dir/${out}.blake3"
       local staging_status_file="$staging_dir/.status"
-
       comp_start=$(date +%s)
       echo "# Created: $(date '+%Y-%m-%d %H:%M:%S')" > "$staging_manifest"
       echo "1" > "$staging_status_file"
@@ -1325,11 +1280,9 @@ archivepar2 () {
         _a2_cleanup
         return 1
       fi
-
       (( abort_flag )) && { _a2_cleanup; return 1; }
 
       local split_prefix="$staging_dir/${out}.tar.zst.part-"
-
       if ! _a2_launch_job pid_main_pipeline pgid_main_pipeline bash -c '
         set -o pipefail
         zstd_cmd="tar -cf - -C '\''$1'\'' '\''$2'\'' | zstd -T0 -10 --long=27 -v --progress | tee '\''$4'\'' | split -d -a 3 -b '\''$5'\'' - '\''$6'\''"
@@ -1339,65 +1292,54 @@ archivepar2 () {
         _a2_cleanup
         return 1
       fi
-
       local pipe_status=1
       if ! _a2_reap_job pid_main_pipeline pgid_main_pipeline pipe_status; then
         _a2_print_log "ERROR: Could not reliably reap archive pipeline."
         _a2_cleanup
         return 1
       fi
-
       if (( pipe_status != 0 )); then
         _a2_print_log "ERROR: archive pipeline failed (status: $pipe_status)"
         _a2_cleanup
         return 1
       fi
-
       (( abort_flag )) && {
         _a2_print_log "ERROR: Operation aborted."
         _a2_cleanup
         return 1
       }
-
       local b3sum_wait_status=1
       if ! _a2_reap_job pid_b3sum pgid_b3sum b3sum_wait_status; then
         _a2_print_log "ERROR: Could not reliably reap global BLAKE3 hashing process."
         _a2_cleanup
         return 1
       fi
-
       local b3sum_file_status="MISSING"
       [[ -f "$staging_status_file" ]] && b3sum_file_status=$(< "$staging_status_file")
-
       if [[ $b3sum_wait_status -ne 0 || "$b3sum_file_status" != "0" ]]; then
         _a2_print_log "ERROR: global BLAKE3 hashing process failed or did not complete successfully"
         _a2_cleanup
         return 1
       fi
-
       if ! _a2_validate_global_manifest "$staging_manifest"; then
         _a2_print_log "ERROR: BLAKE3 manifest missing or has invalid/duplicate/misplaced global archive entry"
         _a2_cleanup
         return 1
       fi
-
       if [[ -f "$zstd_err_file" ]]; then
         zstd_golden_line=$(tr '\r' '\n' < "$zstd_err_file" | grep -E 'GiB|MiB|B =>' | tail -n1 | sed 's/^[ \t]*//')
       fi
-
       if [[ -n "$zstd_golden_line" ]]; then
         _a2_print_log "--------------------------------------------------"
         _a2_print_log "            ZSTD COMPRESSION METRICS"
         _a2_print_log "--------------------------------------------------"
         _a2_print_log "$zstd_golden_line"
       fi
-
       (( abort_flag )) && { _a2_cleanup; return 1; }
 
       _a2_print_log "\n[SPLIT MODE] Collecting split parts and hashing individual files..."
       _a2_update_parts_array "$staging_dir"
       [[ ${#parts[@]} -gt 0 ]] || { _a2_print_log "ERROR: no split parts found in staging"; _a2_cleanup; return 1; }
-
       if ! _a2_launch_job pid_helper pgid_helper bash -c '
         manifest="$1"
         shift
@@ -1417,46 +1359,35 @@ archivepar2 () {
         _a2_cleanup
         return 1
       fi
-
       local helper_status=1
       if ! _a2_reap_job pid_helper pgid_helper helper_status; then
         _a2_print_log "ERROR: Could not reliably reap split parts hashing job."
         _a2_cleanup
         return 1
       fi
-
       if (( helper_status != 0 )) || (( abort_flag )); then
         _a2_print_log "ERROR: failed to compute hashes for split parts or operation aborted."
         _a2_cleanup
         return 1
       fi
-
       _a2_print_log "[BLAKE3 MANIFEST CONTENT]"
       cat "$staging_manifest" >> "$logfile"
       cat "$staging_manifest"
-
       comp_end=$(date +%s)
       t_compress_dur=$(_a2_format_duration $((comp_end - comp_start)))
       compress_status="SUCCESS"
-
-      _a2_check_content_integrity || {
-        _a2_cleanup
-        return 1
-      }
+      _a2_check_content_integrity || { _a2_cleanup; return 1; }
 
       local par2_start par2_end
       par2_start=$(date +%s)
       _a2_print_log "[PAR2] Creating recovery files..."
-
       local -a rel_parts=()
       local p
       for p in "${parts[@]}"; do
         rel_parts+=( "$(basename "$p")" )
       done
-
       local par2_cmd
       par2_cmd=$(printf "par2 create -r10 %q " "${out}.par2"; printf "%q " "${rel_parts[@]}"; printf "%q" "$(basename "$staging_manifest")")
-
       if ! _a2_launch_job pid_par2 pgid_par2 bash -c '
         cd "$1" || exit 1
         script -q -f "$2" -c "$3"
@@ -1465,97 +1396,102 @@ archivepar2 () {
         _a2_cleanup
         return 1
       fi
-
       local par2_exit_status=1
       if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
         _a2_print_log "ERROR: Could not reliably reap PAR2 job."
         _a2_cleanup
-        return 1
+        return 1      
       fi
-
       if [[ -f "$par2_tty_file" ]]; then
         tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
       fi
-
       (( abort_flag )) && { _a2_cleanup; return 1; }
-
       if (( par2_exit_status != 0 )); then
         par2_status="FAILED"
         _a2_print_log "ERROR: PAR2 creation failed"
         _a2_cleanup
         return 1
       fi
-
       par2_end=$(date +%s)
       t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
       par2_status="SUCCESS"
+      par2_done=1
 
-      if ! _a2_commit_staging "$staging_dir" "$backup_dir"; then
-        _a2_print_log "ERROR: commit failed; previous backup may be partially overwritten"
-        _a2_cleanup
-        return 1
+      if (( use_legacy_commit )); then
+        if ! _a2_commit_staging "$staging_dir" "$backup_dir"; then
+          _a2_print_log "ERROR: legacy commit failed; previous backup may be partially overwritten"
+          _a2_cleanup
+          return 1
+        fi
+        _a2_prune_obsolete_parts "$backup_dir"
+      else
+        if ! _a2_commit_versioned "$staging_dir" "$backup_dir"; then
+          _a2_print_log "ERROR: versioned commit failed; previous backup remains active"
+          _a2_cleanup
+          return 1
+        fi
+        _a2_prune_old_versions "$backup_dir" "$keep_versions"
       fi
-
-      _a2_prune_obsolete_parts "$backup_dir"
-
-      _a2_cleanup_staging
+      staging_dir=""
+      staging_committed=0
     fi
 
     (( abort_flag )) && { _a2_cleanup; return 1; }
 
-    # PAR2 for the resume path (skip if we just committed; the commit
-    # already published PAR2 from staging)
-    if (( ! staging_committed )); then
-      local par2_start par2_end
-      par2_start=$(date +%s)
-      _a2_print_log "[PAR2] Creating recovery files..."
-
-      local -a rel_parts=()
-      local p
-      for p in "${parts[@]}"; do
-        rel_parts+=("$(basename "$p")")
-      done
-
-      local par2_cmd
-      par2_cmd=$(printf "par2 create -r10 %q " "${out}.par2"; printf "%q " "${rel_parts[@]}"; printf "%q" "$manifest")
-
-      if ! _a2_launch_job pid_par2 pgid_par2 bash -c 'script -q -f "$1" -c "$2"' _ "$par2_tty_file" "$par2_cmd"; then
-        _a2_print_log "ERROR: Failed to launch PAR2 job."
-        _a2_cleanup
-        return 1
+    if (( ! par2_done )); then
+      local active_par2="$active_dir/${out}.par2"
+      if [[ -f "$active_par2" ]]; then
+        _a2_print_log "[PAR2] Existing recovery files found in active version; skipping PAR2 creation."
+        par2_status="SUCCESS"
+        par2_done=1
+      else
+        local par2_start par2_end
+        par2_start=$(date +%s)
+        _a2_print_log "[PAR2] Creating recovery files (resume path)..."
+        local -a rel_parts=()
+        local p
+        for p in "${parts[@]}"; do
+          rel_parts+=("$(basename "$p")")
+        done
+        local par2_cmd
+        par2_cmd=$(printf "par2 create -r10 %q " "${out}.par2"; printf "%q " "${rel_parts[@]}"; printf "%q" "$(basename "$manifest")")
+        if ! _a2_launch_job pid_par2 pgid_par2 bash -c '
+          cd "$1" || exit 1
+          script -q -f "$2" -c "$3"
+        ' _ "$active_dir" "$par2_tty_file" "$par2_cmd"; then
+          _a2_print_log "ERROR: Failed to launch PAR2 job."
+          _a2_cleanup
+          return 1
+        fi
+        local par2_exit_status=1
+        if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
+          _a2_print_log "ERROR: Could not reliably reap PAR2 job."
+          _a2_cleanup
+          return 1
+        fi
+        if [[ -f "$par2_tty_file" ]]; then
+          tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
+        fi
+        (( abort_flag )) && { _a2_cleanup; return 1; }
+        if (( par2_exit_status != 0 )); then
+          par2_status="FAILED"
+          _a2_cleanup
+          return 1
+        fi
+        par2_end=$(date +%s)
+        t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
+        par2_status="SUCCESS"
+        par2_done=1
       fi
-
-      local par2_exit_status=1
-      if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
-        _a2_print_log "ERROR: Could not reliably reap PAR2 job."
-        _a2_cleanup
-        return 1
-      fi
-
-      if [[ -f "$par2_tty_file" ]]; then
-        tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
-      fi
-
-      (( abort_flag )) && { _a2_cleanup; return 1; }
-
-      if (( par2_exit_status != 0 )); then
-        par2_status="FAILED"
-        _a2_cleanup
-        return 1
-      fi
-
-      par2_end=$(date +%s)
-      t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
-      par2_status="SUCCESS"
     fi
 
   else
     # ==================== MODO SINGLE FILE ====================
     _a2_print_log "[MODE] Single file"
-
     (( abort_flag )) && { _a2_cleanup; return 1; }
 
-    if [[ -f "${out}.tar.zst" ]]; then
+    local active_single="$active_dir/${out}.tar.zst"
+    if [[ -f "$active_single" ]]; then
       _a2_print_log "[RESUME] Found existing target archive. Testing its integrity directly..."
       _a2_verify_manifest_single
       local v_status=$?
@@ -1563,7 +1499,7 @@ archivepar2 () {
         _a2_print_log "[BLAKE3] Manifest OK"
         if _a2_check_content_integrity; then
           _a2_print_log "[RESUME] Existing archive is healthy! Skipping compression stage."
-          _a2_show_manifest
+          _a2_show_manifest "$active_dir/${out}.blake3"
           run_compression=0
         fi
       elif (( v_status == 10 )); then
@@ -1581,7 +1517,6 @@ archivepar2 () {
         return 1
       fi
     fi
-
     (( abort_flag )) && { _a2_cleanup; return 1; }
 
     if (( run_compression )); then
@@ -1590,29 +1525,25 @@ archivepar2 () {
         _a2_cleanup
         return 1
       fi
-
       local staging_manifest="$staging_dir/${out}.blake3"
       local staging_status_file="$staging_dir/.status"
       local staging_archive="$staging_dir/${out}.tar.zst"
-
       comp_start=$(date +%s)
       echo "# Created: $(date '+%Y-%m-%d %H:%M:%S')" > "$staging_manifest"
       echo "1" > "$staging_status_file"
-
       if ! _a2_launch_job pid_b3sum pgid_b3sum bash -c '
         set -o pipefail
         if b3sum < "$1" | awk -v target="$2" '\''{print $1 "  " target}'\'' >> "$3"; then
           echo "0" > "$4"
-        else          echo "1" > "$4"
+        else
+          echo "1" > "$4"
         fi
       ' _ "$hash_fifo" "${out}.tar.zst" "$staging_manifest" "$staging_status_file"; then
         _a2_print_log "ERROR: Failed to launch b3sum job."
         _a2_cleanup
         return 1
       fi
-
       (( abort_flag )) && { _a2_cleanup; return 1; }
-
       if ! _a2_launch_job pid_main_pipeline pgid_main_pipeline bash -c '
         set -o pipefail
         zstd_cmd="tar -cf - -C '\''$1'\'' '\''$2'\'' | zstd -T0 -10 --long=27 -v --progress | tee '\''$4'\'' > '\''$5'\''"
@@ -1622,79 +1553,61 @@ archivepar2 () {
         _a2_cleanup
         return 1
       fi
-
       local pipe_status=1
       if ! _a2_reap_job pid_main_pipeline pgid_main_pipeline pipe_status; then
         _a2_print_log "ERROR: Could not reliably reap archive creation pipeline."
         _a2_cleanup
         return 1
       fi
-
       if (( pipe_status != 0 )); then
         _a2_print_log "ERROR: archive creation pipeline failed (status: $pipe_status)"
         _a2_cleanup
         return 1
       fi
-
       (( abort_flag )) && {
         _a2_print_log "ERROR: Operation aborted."
         _a2_cleanup
         return 1
       }
-
       local b3sum_wait_status=1
       if ! _a2_reap_job pid_b3sum pgid_b3sum b3sum_wait_status; then
         _a2_print_log "ERROR: Could not reliably reap global BLAKE3 hashing process."
         _a2_cleanup
         return 1
       fi
-
       local b3sum_file_status="MISSING"
       [[ -f "$staging_status_file" ]] && b3sum_file_status=$(< "$staging_status_file")
-
       if [[ $b3sum_wait_status -ne 0 || "$b3sum_file_status" != "0" ]]; then
         _a2_print_log "ERROR: global BLAKE3 hashing process failed or did not complete successfully"
         _a2_cleanup
         return 1
       fi
-
       if ! _a2_validate_global_manifest "$staging_manifest"; then
         _a2_print_log "ERROR: BLAKE3 manifest missing or has invalid/duplicate/misplaced global archive entry"
         _a2_cleanup
         return 1
       fi
-
       if [[ -f "$zstd_err_file" ]]; then
         zstd_golden_line=$(tr '\r' '\n' < "$zstd_err_file" | grep -E 'GiB|MiB|B =>' | tail -n1 | sed 's/^[ \t]*//')
       fi
-
       if [[ -n "$zstd_golden_line" ]]; then
         _a2_print_log "--------------------------------------------------"
         _a2_print_log "            ZSTD COMPRESSION METRICS"
         _a2_print_log "--------------------------------------------------"
         _a2_print_log "$zstd_golden_line"
       fi
-
       _a2_print_log "[BLAKE3 MANIFEST CONTENT]"
       cat "$staging_manifest" >> "$logfile"
       cat "$staging_manifest"
-
       comp_end=$(date +%s)
       t_compress_dur=$(_a2_format_duration $((comp_end - comp_start)))
       compress_status="SUCCESS"
-
-      _a2_check_content_integrity || {
-        _a2_cleanup
-        return 1
-      }
-
+      _a2_check_content_integrity || { _a2_cleanup; return 1; }
       local par2_start par2_end
       par2_start=$(date +%s)
       _a2_print_log "[PAR2] Creating recovery files..."
-
       local par2_cmd
       par2_cmd=$(printf "par2 create -r10 %q %q %q" "${out}.par2" "${out}.tar.zst" "$(basename "$staging_manifest")")
-
       if ! _a2_launch_job pid_par2 pgid_par2 bash -c '
         cd "$1" || exit 1
         script -q -f "$2" -c "$3"
@@ -1703,78 +1616,86 @@ archivepar2 () {
         _a2_cleanup
         return 1
       fi
-
       local par2_exit_status=1
       if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
         _a2_print_log "ERROR: Could not reliably reap PAR2 job."
         _a2_cleanup
         return 1
       fi
-
       if [[ -f "$par2_tty_file" ]]; then
         tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
       fi
-
       (( abort_flag )) && { _a2_cleanup; return 1; }
-
       if (( par2_exit_status != 0 )); then
         par2_status="FAILED"
         _a2_print_log "ERROR: PAR2 creation failed"
         _a2_cleanup
         return 1
       fi
-
       par2_end=$(date +%s)
       t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
       par2_status="SUCCESS"
+      par2_done=1
 
-      if ! _a2_commit_staging "$staging_dir" "$backup_dir"; then
-        _a2_print_log "ERROR: commit failed; previous backup may be partially overwritten"
-        _a2_cleanup
-        return 1
+      if (( use_legacy_commit )); then
+        if ! _a2_commit_staging "$staging_dir" "$backup_dir"; then
+          _a2_print_log "ERROR: legacy commit failed; previous backup may be partially overwritten"
+          _a2_cleanup
+          return 1
+        fi
+      else
+        if ! _a2_commit_versioned "$staging_dir" "$backup_dir"; then
+          _a2_print_log "ERROR: versioned commit failed; previous backup remains active"
+          _a2_cleanup
+          return 1
+        fi
+        _a2_prune_old_versions "$backup_dir" "$keep_versions"
       fi
-
-      _a2_cleanup_staging
+      staging_dir=""
+      staging_committed=0
     fi
-
     (( abort_flag )) && { _a2_cleanup; return 1; }
 
-    if (( ! staging_committed )); then
-      local par2_start par2_end
-      par2_start=$(date +%s)
-      _a2_print_log "[PAR2] Creating recovery files..."
-
-      local par2_cmd
-      par2_cmd=$(printf "par2 create -r10 %q %q %q" "${out}.par2" "${out}.tar.zst" "$manifest")
-
-      if ! _a2_launch_job pid_par2 pgid_par2 bash -c 'script -q -f "$1" -c "$2"' _ "$par2_tty_file" "$par2_cmd"; then
-        _a2_print_log "ERROR: Failed to launch PAR2 job."
-        _a2_cleanup
-        return 1
+    if (( ! par2_done )); then
+      local active_par2="$active_dir/${out}.par2"
+      if [[ -f "$active_par2" ]]; then
+        _a2_print_log "[PAR2] Existing recovery files found in active version; skipping PAR2 creation."
+        par2_status="SUCCESS"
+        par2_done=1
+      else
+        local par2_start par2_end
+        par2_start=$(date +%s)
+        _a2_print_log "[PAR2] Creating recovery files (resume path)..."
+        local par2_cmd
+        par2_cmd=$(printf "par2 create -r10 %q %q %q" "${out}.par2" "${out}.tar.zst" "$(basename "$manifest")")
+        if ! _a2_launch_job pid_par2 pgid_par2 bash -c '
+          cd "$1" || exit 1
+          script -q -f "$2" -c "$3"
+        ' _ "$active_dir" "$par2_tty_file" "$par2_cmd"; then
+          _a2_print_log "ERROR: Failed to launch PAR2 job."
+          _a2_cleanup
+          return 1
+        fi
+        local par2_exit_status=1
+        if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
+          _a2_print_log "ERROR: Could not reliably reap PAR2 job."
+          _a2_cleanup
+          return 1
+        fi
+        if [[ -f "$par2_tty_file" ]]; then
+          tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
+        fi
+        (( abort_flag )) && { _a2_cleanup; return 1; }
+        if (( par2_exit_status != 0 )); then
+          par2_status="FAILED"
+          _a2_cleanup
+          return 1
+        fi
+        par2_end=$(date +%s)
+        t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
+        par2_status="SUCCESS"
+        par2_done=1
       fi
-
-      local par2_exit_status=1
-      if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
-        _a2_print_log "ERROR: Could not reliably reap PAR2 job."
-        _a2_cleanup
-        return 1
-      fi
-
-      if [[ -f "$par2_tty_file" ]]; then
-        tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
-      fi
-
-      (( abort_flag )) && { _a2_cleanup; return 1; }
-
-      if (( par2_exit_status != 0 )); then
-        par2_status="FAILED"
-        _a2_cleanup
-        return 1
-      fi
-
-      par2_end=$(date +%s)
-      t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
-      par2_status="SUCCESS"
     fi
   fi
 
