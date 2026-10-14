@@ -1,7 +1,12 @@
-# Version Details: v0.16.3.1
-# Change: Added layout detection (_a2_detect_layout, _a2_resolve_active_dir),
-#         same-filesystem check for future staging, and diagnostic logging.
-#         No functional change: behaves identically to v0.16.3 on legacy layout.
+# Version Details: v0.16.3.1a
+# Change: Reverted _a2_check_content_integrity to use $backup_dir instead of
+#         $active_dir. The v0.16.3.1 introduction of $active_dir in this function
+#         was premature: other components (_a2_update_parts_array, compression
+#         pipeline, manifest generation, PAR2) still operate on $backup_dir.
+#         In versioned layout, this caused a path mismatch and TAR CHECK failure.
+#         Layout detection and diagnostics from v0.16.3.1 are preserved unchanged.
+#         True versioning support (moving all components to $active_dir) is
+#         deferred to v0.16.3.3.
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
     echo "Error: no input folder provided" >&2
@@ -281,7 +286,7 @@ archivepar2 () {
   echo "Output Base Name: $out" >> "$logfile"
   echo "Target Directory: $backup_dir" >> "$logfile"
   echo "Arguments Used  : Single Mode=$single_mode | Fast Mode=$fast_mode | Max Size=$maxsize" >> "$logfile"
-  echo "Version         : v0.16.3.1" >> "$logfile"
+  echo "Version         : v0.16.3.1a" >> "$logfile"
   echo "--------------------------------------------------" >> "$logfile"
 
   _a2_print_log() {
@@ -296,20 +301,11 @@ archivepar2 () {
   # ============================================================
   # v0.16.3.1 — Layout detection and diagnostics
   # ============================================================
-  #
-  # Detects whether the backup directory uses:
-  #   - "legacy"    : files directly in $backup_dir (v0.16.3 and earlier)
-  #   - "versioned" : $backup_dir/current -> $backup_dir/v<timestamp>/
-  #   - "empty"     : no recognizable backup artifacts present
-  #
-  # This is purely informational in v0.16.3.1. Subsequent revisions
-  # (v0.16.3.3+) will use this to decide between legacy and versioned
-  # operation.
+  # (unchanged from v0.16.3.1)
   #
   _a2_detect_layout() {
     local target="$1"
 
-    # Versioned layout: symlink 'current' OR any v<timestamp> subdirectory
     if [[ -L "$target/current" ]]; then
       echo "versioned"
       return 0
@@ -319,7 +315,6 @@ archivepar2 () {
       return 0
     fi
 
-    # Legacy layout: recognizable backup artifacts directly in target
     if compgen -G "$target/${out}.tar.zst.part-*" > /dev/null; then
       echo "legacy"
       return 0
@@ -333,17 +328,6 @@ archivepar2 () {
     return 0
   }
 
-  # Returns the directory containing the active backup artifacts.
-  #
-  #   legacy/empty -> $backup_dir itself
-  #   versioned    -> realpath of $backup_dir/current (if symlink exists),
-  #                   otherwise the lexicographically latest v<timestamp>/
-  #
-  # In v0.16.3.1, only "legacy" and "empty" are possible in practice,
-  # so this always returns $backup_dir. The versioned branch is present
-  # for forward compatibility and is exercised only if a user manually
-  # creates a versioned layout.
-  #
   _a2_resolve_active_dir() {
     local target="$1"
     local layout
@@ -361,7 +345,6 @@ archivepar2 () {
         else
           local latest=""
           local v
-          # Lexicographic sort works because the format is vYYYYMMDD-HHMMSS
           while IFS= read -r v; do
             [[ -n "$v" ]] && latest="$v"
           done < <(ls -1d "$target"/v[0-9]*-[0-9]* 2>/dev/null | sort)
@@ -410,13 +393,6 @@ archivepar2 () {
     fi
   }
 
-  # Verifies that two paths reside on the same filesystem device.
-  # This matters for v0.16.3.3+, where the staging directory must be
-  # renameable into the backup directory without copying data.
-  #
-  # Returns 0 if same device, 1 otherwise. On platforms without
-  # GNU stat -c %d, returns 0 (assume same) to avoid false negatives.
-  #
   _a2_check_same_filesystem() {
     local path_a="$1"
     local path_b="$2"
@@ -436,9 +412,6 @@ archivepar2 () {
 
   _a2_log_layout_diagnostics "$backup_dir"
 
-  # Same-filesystem check for future staging (v0.16.3.3+).
-  # In v0.16.3.1 we only log the result; we do not abort on mismatch
-  # because staging does not exist yet.
   if _a2_check_same_filesystem "$backup_dir" "$backup_dir"; then
     _a2_print_log "[FS] Backup directory filesystem check: same-device trivially OK"
   else
@@ -621,6 +594,15 @@ archivepar2 () {
     fi
   }
 
+  # ============================================================
+  # v0.16.3.1a — Reverted to $backup_dir
+  # ============================================================
+  # The v0.16.3.1 version of this function used $active_dir, which was
+  # inconsistent with the rest of the pipeline (still operating on
+  # $backup_dir). In versioned layout, this caused TAR CHECK to read
+  # from a directory that did not contain the freshly generated parts.
+  # Reverting to $backup_dir restores v0.16.3 behavior.
+  #
   _a2_check_content_integrity() {
     (( abort_flag )) && return 1
 
@@ -637,25 +619,19 @@ archivepar2 () {
 
     (( abort_flag )) && return 1
 
-    # v0.16.3.1: use _a2_resolve_active_dir so that future versioned
-    # layouts are handled transparently. On legacy layout this returns
-    # $backup_dir, identical to v0.16.3 behavior.
-    local active_dir
-    active_dir=$(_a2_resolve_active_dir "$backup_dir")
-
     local status=0
     if (( single_mode )); then
         _a2_launch_job pid_check pgid_check bash -c '
           set -o pipefail
           cd "$1" || exit 1
           zstd -dc --progress "$2/$3.tar.zst" | tar --diff -f -
-        ' _ "$parent_dir" "$active_dir" "$out"
+        ' _ "$parent_dir" "$backup_dir" "$out"
     else
         _a2_launch_job pid_check pgid_check bash -c '
           set -o pipefail
           cd "$1" || exit 1
           cat "${@:3}" | zstd -dc --progress | tar --diff -f -
-        ' _ "$parent_dir" "$active_dir" "${parts[@]/#/$active_dir/}"
+        ' _ "$parent_dir" "$backup_dir" "${parts[@]/#/$backup_dir/}"
     fi
 
     if (( $? != 0 )); then
@@ -690,8 +666,6 @@ archivepar2 () {
     local orig_nullglob=0
     [[ -o nullglob ]] && orig_nullglob=1
     shopt -s nullglob
-    # v0.16.3.1: unchanged. Still globs against $PWD ($backup_dir).
-    # Subsequent revisions will parameterize this by active_dir.
     parts=( "${out}.tar.zst.part-"* )
     (( orig_nullglob )) || shopt -u nullglob
   }
