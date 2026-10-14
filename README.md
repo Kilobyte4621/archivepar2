@@ -56,9 +56,11 @@ restorepar2 /backup/destination/location/location1-bak extract
 ```
 ---
 
-## 1. Core Component: `archivepar2` (v0.16)
+## 1. Core Component: `archivepar2` (v0.17)
 
-The `archivepar2` function is the primary archive creation engine. It transforms a target directory into a compressed, integrity-verified, and error-recoverable backup using TAR, Zstandard, BLAKE3, and PAR2. The current implementation emphasizes synchronous integrity verification, controlled process lifecycles, interruption handling, and reliable resource cleanup.
+The `archivepar2` function is the primary archive creation engine. It transforms a target directory into a compressed, integrity-verified, and error-recoverable backup using TAR, Zstandard, BLAKE3, and PAR2.
+
+Starting with **v0.17**, the utility uses a **versioned backup layout** with atomic publication, isolation of in-progress work, and configurable retention. The current implementation emphasizes synchronous integrity verification, controlled process lifecycles, interruption handling, transactional replacement of backups, and reliable resource cleanup.
 
 ### Key Functionalities
 
@@ -70,6 +72,11 @@ The `archivepar2` function is the primary archive creation engine. It transforms
   - **Default Mode:** Performs a post-compression `tar --diff` check against the source directory.
   - **Fast Mode (`--FAST`):** Skips the post-compression TAR content comparison.
 - **Cryptographic Integrity Manifests:** Generates a `.blake3` manifest containing the archive's global BLAKE3 hash and the hashes of the archive parts, enabling later integrity verification.
+- **Transactional Replacement (v0.17):** The new archive is generated in an isolated staging directory, validated end-to-end, and only published on success. If anything fails before publication, the previous backup remains intact and usable.
+- **Versioned Layout (v0.17):** Each backup is stored in its own `v<timestamp>/` directory, with a `current` symlink pointing to the active version. Publication uses atomic directory rename plus an atomic symlink swap.
+- **Automatic Migration (v0.17):** Existing legacy layouts are migrated to the versioned layout automatically, preserving all files. Use `--NO-MIGRATE` to opt out.
+- **Configurable Retention (v0.17):** Old versions can be pruned automatically based on a configurable count (`--KEEP N` or `ARCHIVEPAR2_KEEP`).
+- **Layered Locking (v0.17):** Prevents concurrent invocations against the same backup directory from corrupting each other, using multiple layers (flock, mkdir lockdir, PID file) so it degrades gracefully across filesystems.
 - **Synchronous Hash Generation:** Coordinates global BLAKE3 hash generation with the main workflow, checks the hashing process's exit status, and validates the manifest before proceeding to PAR2 generation.
 - **Strict Manifest Validation:** Validates the global hash entry's format and rejects malformed, missing, or duplicate entries.
 - **Managed Background Processes:** Launches long-running jobs in controlled process groups, tracks their status, and handles termination and reaping.
@@ -82,14 +89,21 @@ The `archivepar2` function is the primary archive creation engine. It transforms
 
 - `--SINGLE`: Creates one `.tar.zst` archive instead of splitting it into multiple parts.
 - `--FAST`: Skips the post-compression `tar --diff` content integrity check.
+- `--KEEP N` (v0.17): Retains **N** old versions in addition to the active version. Default: `3`.
+- `--NO-MIGRATE` (v0.17): Disables the automatic migration from the legacy layout. When set, `archivepar2` operates in the legacy layout and does not create `v<timestamp>/` directories or the `current` symlink.
 - `Size` (e.g., `500M`, `4G`): Sets the maximum size of each archive part in split mode. The default is `2G`.
+
+#### Environment Variables
+
+- `ARCHIVEPAR2_KEEP=N` (v0.17): Fallback for `--KEEP N`. The command-line flag has precedence. Used only when `--KEEP` is not passed.
 
 ### Detailed Workflow of `archivepar2`
 
 #### 1. Environment and Argument Handling
 
 - Validates the input and requires a source directory.
-- Parses `--SINGLE`, `--FAST`, and an optional custom split size.
+- Parses `--SINGLE`, `--FAST`, `--KEEP N`, `--NO-MIGRATE`, and an optional custom split size.
+- Resolves `--KEEP` precedence: flag > `ARCHIVEPAR2_KEEP` > default `3`.
 - Enables `pipefail` during execution so that failures in commands within pipelines, such as `tar`, `zstd`, or other pipeline components, are not silently ignored.
 - Preserves the relevant shell state so temporary changes do not unintentionally affect the calling shell.
 
@@ -99,22 +113,68 @@ The `archivepar2` function is the primary archive creation engine. It transforms
 - Initializes a session log recording relevant execution details, including the start timestamp, source path, selected arguments, and performance information.
 - Uses consistent helper-function naming to distinguish internal implementation details from public functionality.
 
-#### 3. Compression and Archive Splitting
+#### 3. Locking and Concurrency Control (v0.17)
+
+Before any heavy work, `archivepar2` acquires a **per-backup-directory lock** to prevent two concurrent invocations from corrupting each other. The lock is acquired using a multi-layer strategy:
+
+1. **Layer 1 — `flock(2)`:** A file lock on `.archivepar2.lock`, held via file descriptor 9. If `flock` is available, this is the primary mechanism.
+2. **Layer 2 — `mkdir lockdir`:** An atomic directory creation of `.archivepar2.lockdir/`. This works on any POSIX-compliant filesystem and is the universal fallback.
+3. **Layer 3 — PID metadata:** Inside `.archivepar2.lockdir/`, `pid`, `time`, and `cmd` files identify the process currently holding the lock.
+
+If any layer indicates the lock is held by another active process, `archivepar2` aborts immediately, without consuming CPU on the pipeline. A message identifies the holder PID, start time, command, and the directory to remove if a manual override is needed.
+
+**Stale lock recovery:** If a lockdir is found but its recorded PID is not an active `archivepar2` process, the lockdir is considered stale and removed automatically.
+
+**Filesystem caveat:** On filesystems with unreliable locking semantics (SSHFS, some FUSE mounts, CIFS, SMB, 9P), a warning is logged. In these cases, `mkdir lockdir` provides best-effort protection but is not a hard guarantee.
+
+#### 4. Layout Detection and Migration (v0.17)
+
+`archivepar2` recognizes three layouts:
+
+- **legacy:** Files (`<out>.tar.zst.part-*`, `<out>.blake3`, `<out>.par2`, etc.) sit directly in the backup directory. This is the v0.16 and earlier layout.
+- **versioned:** Each backup lives in its own `v<timestamp>/` subdirectory, and a `current` symlink points to the active version.
+- **empty:** No recognizable backup artifacts present.
+
+Unless `--NO-MIGRATE` is set, an existing legacy layout is migrated automatically:
+
+1. A new version directory `v<timestamp>/` is created.
+2. All legacy artifacts are moved into it (`mv`, not copy — atomic on the same filesystem).
+3. The `current` symlink is created pointing to the new version directory.
+
+The migration is **non-destructive**: if a step fails, the files are moved back and the migration aborts, leaving the legacy layout intact. On the next successful run, the migration retries.
+
+If `--NO-MIGRATE` is set and the layout is legacy, `archivepar2` continues operating in the legacy layout. New backups are published directly into the backup directory (files sit at the top level, no `current` symlink). This preserves backward compatibility for users who prefer the flat layout.
+
+#### 5. Staging and Isolation (v0.17)
+
+Generation happens in an isolated staging directory `.staging.<run_id>/` inside the backup directory. All heavy work is performed there:
+
+- Compression (TAR → Zstandard → split)
+- BLAKE3 manifest generation
+- TAR content integrity check
+- PAR2 recovery data generation
+
+The active backup is **not touched** until publication. If the operation fails, is interrupted, or the validation does not pass, the staging directory is removed and the previous backup remains intact and usable.
+
+Staging is placed inside the backup directory to guarantee it resides on the same filesystem as the final destination. This allows publication via `rename(2)`, which is atomic and does not copy data.
+
+Orphaned staging directories from prior interrupted runs are cleaned up automatically on the next successful lock acquisition.
+
+#### 6. Compression and Archive Splitting
 
 - **Split Mode (Default):** Compresses the source directory and divides the resulting archive into parts according to the configured maximum size. The default part size is `2G`.
 - **Single Mode:** Produces one `.tar.zst` file without splitting.
-- Removes stale split parts when preparing a new archive, preventing leftover files from a previous run from being mistaken for part of the current backup.
 - Uses progress reporting during the relevant archive-processing stages.
 
-#### 4. TAR Content Integrity Verification
+#### 7. TAR Content Integrity Verification
 
-- Unless `--FAST` is specified, runs a post-compression `tar --diff` comparison between the source directory and the compressed archive.
+- Unless `--FAST` is specified, runs a post-compression `tar --diff` comparison between the source directory and the compressed archive (read from staging).
 - Treats verification as a managed job and checks its completion status before proceeding.
 - Stops the operation when the content integrity check fails rather than reporting an unsuccessful archive as successfully verified.
 
-#### 5. BLAKE3 Manifest Generation and Validation
+#### 8. BLAKE3 Manifest Generation and Validation
 
-- Generates a BLAKE3 manifest containing the global hash of the complete archive and hashes for its individual archive parts.
+- Generates a BLAKE3 manifest containing the global hash of the complete archive and hashes for its individual archive parts. The manifest is generated in staging.
 - Calculates the global BLAKE3 hash during compression and coordinates its completion with the main workflow.
 - Uses a FIFO-based communication mechanism and a status file to coordinate the global hashing job with the main function.
 - Checks the hashing process's exit status before treating the manifest as complete.
@@ -122,13 +182,46 @@ The `archivepar2` function is the primary archive creation engine. It transforms
 - Applies managed process and status handling to hashing operations used during the workflow, including resume-related verification where applicable.
 - Validates the manifest before proceeding to PAR2 generation.
 
-#### 6. PAR2 Recovery Data Generation
+#### 9. PAR2 Recovery Data Generation
 
-- Generates PAR2 recovery data to provide redundancy that can help repair damaged or missing archive data, subject to the available recovery blocks.
+- Generates PAR2 recovery data in staging to provide redundancy that can help repair damaged or missing archive data, subject to the available recovery blocks.
 - Manages the PAR2 job's process lifecycle and checks its outcome rather than relying solely on whether the command was launched.
 - Routes failures through the function's error-handling and cleanup mechanisms.
 
-#### 7. Background Process Lifecycle Management
+#### 10. Publication and Versioned Commit (v0.17)
+
+Once generation, validation, and PAR2 creation have succeeded in staging, `archivepar2` publishes the result.
+
+**In versioned mode** (`use_legacy_commit=0`):
+
+1. The staging directory is renamed to a new `v<timestamp>/` directory. This is a single `rename(2)` on the same filesystem — atomic and immediate.
+2. A `current.tmp` symlink is created pointing to the new version.
+3. `current.tmp` is renamed over `current` via `mv -T`. This is the atomic publication point.
+4. Old versions beyond the retention count are pruned.
+
+Consumers that resolve `current` see either the old version or the new version, never an inconsistent state.
+
+**In legacy mode** (`use_legacy_commit=1`, used when `--NO-MIGRATE` is set):
+
+1. Each file in staging is moved into the backup directory, in the order: parts → manifest → PAR2.
+2. The staging directory is removed.
+3. Obsolete parts from the previous backup that are not overwritten by the new one are pruned (based on the newly published manifest).
+
+This preserves the flat layout but does not provide the same atomicity guarantee as versioned mode.
+
+#### 11. Retention (v0.17)
+
+In versioned mode, after a successful commit, `archivepar2` prunes old versions. The active version (`current`) is always preserved. At most `KEEP` old versions are retained.
+
+The count is resolved from, in order of precedence:
+
+1. `--KEEP N` on the command line
+2. `ARCHIVEPAR2_KEEP` environment variable
+3. Default: `3`
+
+For example, with `--KEEP 3`, up to 4 versions are kept (active + 3 old).
+
+#### 12. Background Process Lifecycle Management
 
 - Launches background jobs through a dedicated helper that establishes and tracks process groups.
 - Uses a process-group handshake and acknowledgement mechanism to coordinate job startup and registration.
@@ -138,47 +231,85 @@ The `archivepar2` function is the primary archive creation engine. It transforms
 - Registers process groups that remain after forced termination so centralized cleanup can make another termination attempt.
 - Treats unresolved process termination as a failure condition instead of assuming that sending a signal guarantees the process has exited.
 
-#### 8. Centralized Cleanup and Shell-State Restoration
+#### 13. Centralized Cleanup and Shell-State Restoration
 
 - Centralizes cleanup for success, failure, and interruption paths.
+- Releases the lock and removes the staging directory.
 - Removes temporary resources created during execution, including temporary files, FIFOs, and job status files.
 - Attempts to terminate and reap tracked background jobs and process groups.
 - Restores the original working directory and relevant shell settings, including the previous `pipefail` state, signal traps, and `nullglob` state.
 - Uses a consistent internal helper prefix to reduce the risk of collisions with unrelated shell functions and variables.
 
-#### 9. Error Handling and Final Status
+#### 14. Error Handling and Final Status
 
 - Reports missing or invalid input and other detected failures explicitly.
 - Propagates errors from managed jobs and verification steps instead of treating successful process launch as proof of successful completion.
 - Uses cleanup paths to handle failed operations and interrupted execution.
 - Retains performance reporting and final status information in the session log.
 
-### Version Comparison: v0.14 vs. v0.16
+### Files Created by `archivepar2`
 
-Version 0.16 focuses on making archive creation more reliable by strengthening BLAKE3 manifest generation, background process management, failure detection, and cleanup.
+The utility creates several files and directories in the backup directory (`<out>-bak/`). Some of them are part of the backup itself and persist; others are infrastructure and are cleaned up automatically.
 
-| Feature | v0.14 | v0.16 |
+| Path | Purpose | Lifecycle |
+|---|---|---|
+| `v<timestamp>/` | One version of the backup (parts, manifest, PAR2) | Persists; pruned by retention |
+| `current` | Symlink to the active version | Persists; atomically swapped on each new version |
+| `<out>.log` | Session log, appended on every run | Persists; never rotated (by design) |
+| `.archivepar2.lock` | Lock file used by `flock(2)` | **Persists** (see note below) |
+| `.archivepar2.lockdir/` | Lock directory used by the `mkdir` layer | Created and removed on each run |
+| `.staging.<run_id>/` | Isolated generation directory | Created and removed on each run |
+
+#### About `.archivepar2.lock`
+
+The `.archivepar2.lock` file is a **zero-byte file** used to hold a `flock(2)` lock. It is intentionally **not removed** after `archivepar2` finishes.
+
+**Why it stays:**
+
+`flock(2)` associates the lock with the open file descriptor, not with the directory entry. If the file were unlinked at the end of a run, a race could occur:
+
+1. Process A holds the lock, opens a file descriptor to inode X.
+2. Process A finishes, closes the descriptor, and unlinks the file. Inode X is scheduled for deletion.
+3. Process B, before inode X is actually deleted, opens the file path and gets a file descriptor to inode X.
+4. Process C creates a **new** file at the same path, which gets a **different** inode Y.
+5. B and C now hold locks on different inodes. They do not block each other.
+
+Keeping the file in place avoids this race. All invocations targeting the same backup directory use the same inode, and `flock(2)` behaves correctly.
+
+**Impact:** None beyond a single hidden 0-byte file in the backup directory. The file is filtered out of the backup parts glob and does not interfere with restore operations.
+
+A future revision may relocate this file to `$XDG_RUNTIME_DIR` to remove the visual clutter without reintroducing the race.
+
+### Version Comparison: v0.14 vs. v0.17
+
+Version 0.17 builds on v0.16 by introducing versioned layout, transactional replacement, layered locking, and configurable retention, while retaining the earlier improvements to BLAKE3 manifest generation, background process management, failure detection, and cleanup.
+
+| Feature | v0.14 | v0.17 |
 |---|---|---|
 | Archive modes | Split and single-archive modes | Retains split and single-archive modes |
-| Split-size configuration | Configurable part sizes | Retains configurable part sizes and stale-part cleanup |
+| Split-size configuration | Configurable part sizes | Retains configurable part sizes |
 | TAR content verification | Post-compression `tar --diff`, unless `--FAST` is used | Retains the optional comparison and integrates it with managed job-status checks |
-| Global BLAKE3 hash | Manifest generation without the current synchronization safeguards | Global hash calculated during compression, with process-status checks and manifest validation |
+| Global BLAKE3 hash | Manifest generation without synchronization safeguards | Global hash calculated during compression, with process-status checks and manifest validation |
 | Manifest validation | Less comprehensive validation | Rejects missing, malformed, or duplicate global hash entries |
 | Background jobs | Less comprehensive process lifecycle management | Explicit process tracking, process groups, startup coordination, and exit-status checks |
 | Interruption handling | Less comprehensive cleanup coordination | Signal handling, termination escalation, and tracked process-group cleanup attempts |
 | Temporary resources | Less centralized resource management | Centralized cleanup of temporary files, FIFOs, and status files |
 | Shell-state preservation | Less comprehensive restoration | Restores relevant shell state, including `pipefail`, traps, working directory, and `nullglob` |
 | Error reporting | Existing error handling | Stronger failure detection across hashing, verification, and managed jobs |
-| Process cleanup guarantees | Not covered by the current detailed limitations disclaimer | Explicitly documented as best-effort, with known process-group detection and TOCTOU limitations |
+| **Backup layout** | Flat (files directly in the backup directory) | **Versioned** (`v<timestamp>/` + `current` symlink), with automatic legacy migration |
+| **Publication** | Direct write to the backup directory | **Transactional**: staging + atomic publish; previous backup preserved until success |
+| **Concurrency** | No protection against concurrent runs | **Layered locking**: `flock` + `mkdir lockdir` + PID metadata |
+| **Retention** | None (manual cleanup) | **`--KEEP N`** / `ARCHIVEPAR2_KEEP`, default 3 |
+| **Stale parts handling** | Removed at start of next run | Versioned layout isolates parts; obsolete parts pruned only within legacy mode |
 
-#### Main Improvements in v0.16
+#### Main Improvements in v0.17
 
-1. **More reliable BLAKE3 manifest generation:** The global hash is calculated during compression, and the workflow checks the relevant process exit statuses and validates the manifest before PAR2 generation.
-2. **Stronger manifest validation:** The global hash entry must be present, unique, and correctly formatted.
-3. **Explicit background process management:** Jobs are tracked using process IDs and process groups, with startup coordination, exit-status checks, and termination escalation.
-4. **Centralized cleanup:** Temporary resources and tracked jobs are handled through a common cleanup mechanism for normal completion, failure, and interruption.
-5. **Better shell-state preservation:** Relevant shell settings and execution context are restored after the function finishes.
-6. **Clearer failure detection:** Failed hashing, integrity checks, and managed jobs are less likely to be mistaken for successful completion.
+1. **Versioned layout:** Each backup is stored in a `v<timestamp>/` directory, with a `current` symlink pointing to the active version. This makes the backup self-describing and eliminates stale-part contamination between runs.
+2. **Transactional replacement:** Generation happens in staging; publication happens atomically. A failed run leaves the previous backup untouched.
+3. **Automatic migration:** Legacy flat layouts are migrated to the versioned layout on the first run, without data loss. `--NO-MIGRATE` opts out.
+4. **Layered locking:** Concurrent invocations against the same backup directory are detected and aborted early, with clear diagnostic messages.
+5. **Configurable retention:** `--KEEP N` or `ARCHIVEPAR2_KEEP` controls how many old versions are kept. Default is 3.
+6. **Retained from v0.16:** Improved BLAKE3 manifest generation, stronger manifest validation, explicit background process management, centralized cleanup, and better shell-state preservation.
 7. **Documented cleanup limitations:** The implementation explicitly distinguishes best-effort process termination from a guarantee that every descendant process will be terminated.
 
 The comparison describes the major implementation changes rather than a claim that every possible failure scenario has been eliminated.
@@ -194,6 +325,8 @@ The archive workflow uses several complementary mechanisms:
 | BLAKE3 part hashes | Allow individual archive parts to be checked against their recorded digests. |
 | PAR2 recovery data | Provides recovery capability for damaged or missing data within the limits of the generated redundancy. |
 | Managed process-status checks | Help ensure that failed hashing, verification, compression, or recovery-data jobs are not silently reported as successful. |
+| Atomic publication (v0.17) | The `current` symlink swap is atomic; consumers never see a partial backup. |
+| Layered locking (v0.17) | Prevents concurrent invocations from corrupting each other. |
 
 These mechanisms serve different purposes: content comparison checks the archived data against the source, BLAKE3 detects changes relative to the recorded hashes, and PAR2 provides a means of recovering certain forms of data loss.
 
@@ -207,6 +340,11 @@ When cleanup cannot be confirmed, the script reports the failure and attempts fu
 
 These limitations do not change the core archive-integrity workflow: the global BLAKE3 hash is calculated during compression, and the script checks the relevant process exit statuses and validates the manifest before proceeding to PAR2 generation.
 
+#### Locking Limitations
+
+The layered locking strategy (see §3 above) provides strong protection on filesystems that support `flock(2)` correctly (ext4, xfs, btrfs, ZFS on Linux, WSL2/ext4). On filesystems where `flock(2)` is not reliable (SSHFS, some FUSE mounts, CIFS/SMB, 9P), only the `mkdir lockdir` layer provides protection, which is best-effort. A warning is logged in these cases.
+
+Note also that the `.archivepar2.lock` file persists intentionally (see "About `.archivepar2.lock`" above). It is a zero-byte hidden file and does not interfere with the backup or restore operations.
 
 ---
 
@@ -291,6 +429,4 @@ The utility provides extensive feedback for every session, which is both display
 * **BLAKE3/Structure Checks:** Verification status of cryptographic hashes.
 * **Total Elapsed Time:** A final timer (MM:SS) for the entire operation.
 
----
-
-
+<!-- --- -->
