@@ -1,16 +1,16 @@
-# Version Details: v0.16.3.3.1a
-# Change: Staging infrastructure only (additive, no functional change).
-#   - Added _a2_remove_orphan_stagings, _a2_create_staging,
-#     _a2_commit_staging, _a2_cleanup_staging.
-#   - _a2_update_parts_array now accepts an optional directory argument
-#     (defaults to $staging_dir if present, else $backup_dir). parts still
-#     contains basenames; the working directory remains $backup_dir.
-#   - _a2_print_log and _a2_format_duration moved earlier in the function
-#     so staging helpers can log.
-#   - _a2_cleanup calls _a2_cleanup_staging after _a2_release_lock.
-#   - _a2_remove_orphan_stagings called right after lock acquisition.
-#   - The compression pipeline still writes to $backup_dir. Migration to
-#     staging happens in v0.16.3.3.1b.
+# Version Details: v0.16.3.3.1b
+# Change: Migrated generation pipeline to staging. Compression, manifest,
+#         per-part hashing, TAR CHECK and PAR2 all run inside
+#         $backup_dir/.staging.<run_id>/. The active backup is untouched
+#         until _a2_commit_staging publishes via mv (rename on same FS).
+#         If anything fails before commit, the previous backup remains
+#         intact and the staging directory is removed.
+#         Added _a2_prune_obsolete_parts, called after successful commit
+#         in split mode to remove parts from the old archive that were
+#         not overwritten by the new one.
+#         _a2_commit_staging now moves files in explicit order:
+#         parts -> manifest -> par2.
+#         _a2_validate_global_manifest accepts an optional manifest path.
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
     echo "Error: no input folder provided" >&2
@@ -223,7 +223,7 @@ archivepar2 () {
                _a2_detect_layout _a2_resolve_active_dir _a2_log_layout_diagnostics \
                _a2_check_same_filesystem _a2_acquire_lock _a2_release_lock \
                _a2_remove_orphan_stagings _a2_create_staging _a2_commit_staging \
-               _a2_cleanup_staging 2>/dev/null || true
+               _a2_cleanup_staging _a2_prune_obsolete_parts 2>/dev/null || true
     else
       return 1
     fi
@@ -320,11 +320,11 @@ archivepar2 () {
   echo "Output Base Name: $out" >> "$logfile"
   echo "Target Directory: $backup_dir" >> "$logfile"
   echo "Arguments Used  : Single Mode=$single_mode | Fast Mode=$fast_mode | Max Size=$maxsize" >> "$logfile"
-  echo "Version         : v0.16.3.3.1a" >> "$logfile"
+  echo "Version         : v0.16.3.3.1b" >> "$logfile"
   echo "--------------------------------------------------" >> "$logfile"
 
   # ============================================================
-  # Logging helpers (moved earlier so staging helpers can log)
+  # Logging helpers
   # ============================================================
   _a2_print_log() {
     echo -e "$@" | tee -a "$logfile"
@@ -442,20 +442,6 @@ archivepar2 () {
   # ============================================================
   # v0.16.3.3.1a — Staging infrastructure
   # ============================================================
-  #
-  # The staging directory isolates in-progress generation from the
-  # active backup. Nothing is published to $backup_dir until
-  # _a2_commit_staging runs. If generation fails, the staging dir is
-  # removed and the previous backup remains intact.
-  #
-  # Staging lives inside $backup_dir (same filesystem) so that the
-  # commit can use rename(2), which is atomic and does not copy data.
-  #
-  # In v0.16.3.3.1a these helpers are NOT yet used by the generation
-  # pipeline. The only function called is _a2_remove_orphan_stagings,
-  # which cleans up leftovers from prior interrupted runs. Migration
-  # of the pipeline to staging happens in v0.16.3.3.1b.
-  #
   _a2_remove_orphan_stagings() {
     local target="$1"
     local orig_nullglob=0
@@ -470,7 +456,6 @@ archivepar2 () {
       [[ -d "$o" ]] || continue
       local base
       base=$(basename "$o")
-      # Format: .staging.<pid>.<random>.<timestamp>
       local pid_part
       pid_part=$(printf '%s' "$base" | awk -F. '{print $3}')
       if [[ "$pid_part" =~ ^[0-9]+$ ]] && kill -0 "$pid_part" 2>/dev/null; then
@@ -522,20 +507,49 @@ archivepar2 () {
     [[ -o nullglob ]] && orig_nullglob=1
     shopt -s nullglob
 
-    local -a files=( "$staging"/* "$staging"/.[!.]* "$staging"/..?* )
-    (( orig_nullglob )) || shopt -u nullglob
+    # Order: parts -> manifest -> par2. Internal files (like .status)
+    # are intentionally NOT published.
+    local -a part_files=( "$staging"/*.tar.zst.part-* )
+    local -a manifest_files=( "$staging"/*.blake3 )
+    local -a par2_files=( "$staging"/*.par2 "$staging"/*.vol*.par2 )
 
-    local f base
     local moved=0
-    for f in "${files[@]}"; do
+    local f base
+
+    for f in "${part_files[@]}"; do
       [[ -e "$f" ]] || continue
       base=$(basename "$f")
-      if ! mv -f "$f" "$target/$base" 2>/dev/null; then
-        _a2_print_log "[COMMIT] ERROR: failed to publish '$base'"
+      mv -f "$f" "$target/$base" 2>/dev/null || {
+        _a2_print_log "[COMMIT] ERROR: failed to publish part '$base'"
+        (( orig_nullglob )) || shopt -u nullglob
         return 1
-      fi
+      }
       (( ++moved ))
     done
+
+    for f in "${manifest_files[@]}"; do
+      [[ -e "$f" ]] || continue
+      base=$(basename "$f")
+      mv -f "$f" "$target/$base" 2>/dev/null || {
+        _a2_print_log "[COMMIT] ERROR: failed to publish manifest '$base'"
+        (( orig_nullglob )) || shopt -u nullglob
+        return 1
+      }
+      (( ++moved ))
+    done
+
+    for f in "${par2_files[@]}"; do
+      [[ -e "$f" ]] || continue
+      base=$(basename "$f")
+      mv -f "$f" "$target/$base" 2>/dev/null || {
+        _a2_print_log "[COMMIT] ERROR: failed to publish par2 '$base'"
+        (( orig_nullglob )) || shopt -u nullglob
+        return 1
+      }
+      (( ++moved ))
+    done
+
+    (( orig_nullglob )) || shopt -u nullglob
 
     _a2_print_log "[COMMIT] Published $moved file(s)."
     staging_committed=1
@@ -552,6 +566,61 @@ archivepar2 () {
       rm -rf "$staging_dir" 2>/dev/null || true
     fi
     staging_dir=""
+    return 0
+  }
+
+  # ============================================================
+  # v0.16.3.3.1b — Prune obsolete parts after commit
+  # ============================================================
+  #
+  # Removes parts in $target that are NOT referenced by the new
+  # manifest (which is now in $target after a successful commit).
+  # Called only in split mode, after _a2_commit_staging succeeded.
+  #
+  _a2_prune_obsolete_parts() {
+    local target="$1"
+    local manifest_name="${out}.blake3"
+
+    [[ -f "$target/$manifest_name" ]] || {
+      _a2_print_log "[PRUNE] WARN: manifest not found in $target; skipping obsolete-part prune"
+      return 0
+    }
+
+    # Collect the basenames of parts referenced by the new manifest.
+    local -A expected=()
+    local line name
+    while IFS= read -r line; do
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      [[ -z "${line// }" ]] && continue
+      name="${line##*[[:space:]]}"
+      name="${name##*/}"
+      [[ "$name" == *".tar.zst.part-"* ]] || continue
+      expected["$name"]=1
+    done < "$target/$manifest_name"
+
+    local orig_nullglob=0
+    [[ -o nullglob ]] && orig_nullglob=1
+    shopt -s nullglob
+
+    local -a existing=( "$target"/${out}.tar.zst.part-* )
+    (( orig_nullglob )) || shopt -u nullglob
+
+    local f base
+    local removed=0
+    for f in "${existing[@]}"; do
+      [[ -e "$f" ]] || continue
+      base=$(basename "$f")
+      if [[ -z "${expected[$base]:-}" ]]; then
+        if rm -f "$f" 2>/dev/null; then
+          (( ++removed ))
+          _a2_print_log "[PRUNE] Removed obsolete part: $base"
+        else
+          _a2_print_log "[PRUNE] WARN: could not remove obsolete part: $base"
+        fi
+      fi
+    done
+
+    (( removed > 0 )) && _a2_print_log "[PRUNE] Removed $removed obsolete part(s)."
     return 0
   }
 
@@ -679,7 +748,7 @@ archivepar2 () {
     # backup_dir use the same inode. The file is 0 bytes and is
     # filtered out of the parts glob by its leading dot.
     #
-    # v0.16.3.3.2 will relocate this file to $XDG_RUNTIME_DIR to
+    # v0.16.3.3.3 will relocate this file to $XDG_RUNTIME_DIR to
     # eliminate the visual clutter without reintroducing the race.
     if command -v flock >/dev/null 2>&1; then
       exec {lock_fd}>&- 2>/dev/null || true
@@ -694,9 +763,6 @@ archivepar2 () {
     return 1
   fi
 
-  # Clean up orphan staging directories from prior interrupted runs
-  # (safe: runs only after lock acquisition, so no concurrent staging
-  # of the same backup_dir can be active).
   _a2_remove_orphan_stagings "$backup_dir"
 
   echo "==============================="
@@ -905,19 +971,38 @@ archivepar2 () {
 
     (( abort_flag )) && return 1
 
+    # Determine where the archive parts live: staging if it exists
+    # (fresh generation), else $backup_dir (resume validation).
+    local where="$backup_dir"
+    if [[ -n "$staging_dir" ]] && [[ -d "$staging_dir" ]]; then
+      where="$staging_dir"
+    fi
+
     local status=0
     if (( single_mode )); then
         _a2_launch_job pid_check pgid_check bash -c '
           set -o pipefail
           cd "$1" || exit 1
           zstd -dc --progress "$2/$3.tar.zst" | tar --diff -f -
-        ' _ "$parent_dir" "$backup_dir" "$out"
+        ' _ "$parent_dir" "$where" "$out"
     else
+        local -a abs_parts=()
+        local p
+        for p in "${parts[@]}"; do
+          abs_parts+=( "$where/$(basename "$p")" )
+        done
+        if (( ${#abs_parts[@]} == 0 )); then
+          _a2_print_log "ERROR: no parts available for integrity check"
+          check_status="FAILED"
+          return 1
+        fi
+
         _a2_launch_job pid_check pgid_check bash -c '
           set -o pipefail
           cd "$1" || exit 1
-          cat "${@:3}" | zstd -dc --progress | tar --diff -f -
-        ' _ "$parent_dir" "$backup_dir" "${parts[@]/#/$backup_dir/}"
+          shift
+          cat "$@" | zstd -dc --progress | tar --diff -f -
+        ' _ "$parent_dir" "${abs_parts[@]}"
     fi
 
     if (( $? != 0 )); then
@@ -948,15 +1033,6 @@ archivepar2 () {
     return $status
   }
 
-  # ============================================================
-  # v0.16.3.3.1a — _a2_update_parts_array parametrized by directory
-  # ============================================================
-  # Accepts an optional directory argument. If empty, uses $staging_dir
-  # if it exists, else $backup_dir. parts is filled with BASENAMES, so
-  # callers continue to work as before (using $PWD = $backup_dir for
-  # relative resolution). The directory argument only controls where
-  # the glob reads from.
-  #
   _a2_update_parts_array() {
     local where="${1:-}"
     if [[ -z "$where" ]]; then
@@ -1146,9 +1222,9 @@ archivepar2 () {
   }
 
   _a2_validate_global_manifest() {
-    local m_file="$manifest"
+    local m_file="${1:-$manifest}"
     local target_name="${out}.tar.zst"
-    
+
     [[ -f "$m_file" ]] || return 1
 
     awk -v target="$target_name" '
@@ -1224,23 +1300,18 @@ archivepar2 () {
     (( abort_flag )) && { _a2_cleanup; return 1; }
 
     if (( run_compression )); then
-      if compgen -G "${out}.tar.zst.part-*" > /dev/null; then
-        if ! rm -f "${out}.tar.zst.part-"*; then
-          _a2_print_log "ERROR: Failed to remove stale split parts prior to compression."
-          _a2_cleanup
-          return 1
-        fi
-      fi
-      _a2_update_parts_array
-      if [[ ${#parts[@]} -gt 0 ]]; then
-        _a2_print_log "ERROR: Stale split parts remain present after cleanup attempt."
+      if ! _a2_create_staging "$backup_dir"; then
+        _a2_print_log "ERROR: failed to create staging directory"
         _a2_cleanup
         return 1
       fi
 
+      local staging_manifest="$staging_dir/${out}.blake3"
+      local staging_status_file="$staging_dir/.status"
+
       comp_start=$(date +%s)
-      echo "# Created: $(date '+%Y-%m-%d %H:%M:%S')" > "$manifest"
-      echo "1" > "$status_file"
+      echo "# Created: $(date '+%Y-%m-%d %H:%M:%S')" > "$staging_manifest"
+      echo "1" > "$staging_status_file"
 
       if ! _a2_launch_job pid_b3sum pgid_b3sum bash -c '
         set -o pipefail
@@ -1249,7 +1320,7 @@ archivepar2 () {
         else
           echo "1" > "$4"
         fi
-      ' _ "$hash_fifo" "${out}.tar.zst" "$manifest" "$status_file"; then
+      ' _ "$hash_fifo" "${out}.tar.zst" "$staging_manifest" "$staging_status_file"; then
         _a2_print_log "ERROR: Failed to launch b3sum job."
         _a2_cleanup
         return 1
@@ -1257,11 +1328,13 @@ archivepar2 () {
 
       (( abort_flag )) && { _a2_cleanup; return 1; }
 
+      local split_prefix="$staging_dir/${out}.tar.zst.part-"
+
       if ! _a2_launch_job pid_main_pipeline pgid_main_pipeline bash -c '
         set -o pipefail
-        zstd_cmd="tar -cf - -C '\''$1'\'' '\''$2'\'' | zstd -T0 -10 --long=27 -v --progress | tee '\''$4'\'' | split -d -a 3 -b '\''$5'\'' - '\''$6.tar.zst.part-'\''"
+        zstd_cmd="tar -cf - -C '\''$1'\'' '\''$2'\'' | zstd -T0 -10 --long=27 -v --progress | tee '\''$4'\'' | split -d -a 3 -b '\''$5'\'' - '\''$6'\''"
         script -q -f "$3" -c "$zstd_cmd"
-      ' _ "$parent_dir" "$base" "$zstd_err_file" "$hash_fifo" "$maxsize" "$out"; then
+      ' _ "$parent_dir" "$base" "$zstd_err_file" "$hash_fifo" "$maxsize" "$split_prefix"; then
         _a2_print_log "ERROR: Failed to launch main compression pipeline job."
         _a2_cleanup
         return 1
@@ -1294,7 +1367,7 @@ archivepar2 () {
       fi
 
       local b3sum_file_status="MISSING"
-      [[ -f "$status_file" ]] && b3sum_file_status=$(< "$status_file")
+      [[ -f "$staging_status_file" ]] && b3sum_file_status=$(< "$staging_status_file")
 
       if [[ $b3sum_wait_status -ne 0 || "$b3sum_file_status" != "0" ]]; then
         _a2_print_log "ERROR: global BLAKE3 hashing process failed or did not complete successfully"
@@ -1302,7 +1375,7 @@ archivepar2 () {
         return 1
       fi
 
-      if ! _a2_validate_global_manifest; then
+      if ! _a2_validate_global_manifest "$staging_manifest"; then
         _a2_print_log "ERROR: BLAKE3 manifest missing or has invalid/duplicate/misplaced global archive entry"
         _a2_cleanup
         return 1
@@ -1322,21 +1395,24 @@ archivepar2 () {
       (( abort_flag )) && { _a2_cleanup; return 1; }
 
       _a2_print_log "\n[SPLIT MODE] Collecting split parts and hashing individual files..."
-      _a2_update_parts_array
-      [[ ${#parts[@]} -gt 0 ]] || { _a2_print_log "ERROR: no split parts found"; _a2_cleanup; return 1; }
+      _a2_update_parts_array "$staging_dir"
+      [[ ${#parts[@]} -gt 0 ]] || { _a2_print_log "ERROR: no split parts found in staging"; _a2_cleanup; return 1; }
 
       if ! _a2_launch_job pid_helper pgid_helper bash -c '
+        manifest="$1"
+        shift
         for part in "$@"; do
           p_size=$(stat -c%s "$part") || exit 1
+          bname=$(basename "$part")
           if command -v pv >/dev/null 2>&1; then
-            hash=$(set -o pipefail; pv -N "Hashing $part" -s "$p_size" -p -t -e -r "$part" | b3sum | awk '\''{print $1}'\'') || exit 1
+            hash=$(set -o pipefail; pv -N "Hashing $bname" -s "$p_size" -p -t -e -r "$part" | b3sum | awk '\''{print $1}'\'') || exit 1
           else
             hash=$(set -o pipefail; b3sum "$part" | awk '\''{print $1}'\'') || exit 1
           fi
           [[ -n "$hash" ]] || exit 1
-          echo "$hash  $part" >> "'"$manifest"'" || exit 1
+          echo "$hash  $bname" >> "$manifest" || exit 1
         done
-      ' _ "${parts[@]}"; then
+      ' _ "$staging_manifest" "${parts[@]/#/$staging_dir/}"; then
         _a2_print_log "ERROR: Failed to launch split parts hashing job."
         _a2_cleanup
         return 1
@@ -1355,7 +1431,9 @@ archivepar2 () {
         return 1
       fi
 
-      _a2_show_manifest
+      _a2_print_log "[BLAKE3 MANIFEST CONTENT]"
+      cat "$staging_manifest" >> "$logfile"
+      cat "$staging_manifest"
 
       comp_end=$(date +%s)
       t_compress_dur=$(_a2_format_duration $((comp_end - comp_start)))
@@ -1365,51 +1443,111 @@ archivepar2 () {
         _a2_cleanup
         return 1
       }
+
+      local par2_start par2_end
+      par2_start=$(date +%s)
+      _a2_print_log "[PAR2] Creating recovery files..."
+
+      local -a rel_parts=()
+      local p
+      for p in "${parts[@]}"; do
+        rel_parts+=( "$(basename "$p")" )
+      done
+
+      local par2_cmd
+      par2_cmd=$(printf "par2 create -r10 %q " "${out}.par2"; printf "%q " "${rel_parts[@]}"; printf "%q" "$(basename "$staging_manifest")")
+
+      if ! _a2_launch_job pid_par2 pgid_par2 bash -c '
+        cd "$1" || exit 1
+        script -q -f "$2" -c "$3"
+      ' _ "$staging_dir" "$par2_tty_file" "$par2_cmd"; then
+        _a2_print_log "ERROR: Failed to launch PAR2 job."
+        _a2_cleanup
+        return 1
+      fi
+
+      local par2_exit_status=1
+      if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
+        _a2_print_log "ERROR: Could not reliably reap PAR2 job."
+        _a2_cleanup
+        return 1
+      fi
+
+      if [[ -f "$par2_tty_file" ]]; then
+        tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
+      fi
+
+      (( abort_flag )) && { _a2_cleanup; return 1; }
+
+      if (( par2_exit_status != 0 )); then
+        par2_status="FAILED"
+        _a2_print_log "ERROR: PAR2 creation failed"
+        _a2_cleanup
+        return 1
+      fi
+
+      par2_end=$(date +%s)
+      t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
+      par2_status="SUCCESS"
+
+      if ! _a2_commit_staging "$staging_dir" "$backup_dir"; then
+        _a2_print_log "ERROR: commit failed; previous backup may be partially overwritten"
+        _a2_cleanup
+        return 1
+      fi
+
+      _a2_prune_obsolete_parts "$backup_dir"
+
+      _a2_cleanup_staging
     fi
 
     (( abort_flag )) && { _a2_cleanup; return 1; }
 
-    local par2_start par2_end
-    par2_start=$(date +%s)
-    _a2_print_log "[PAR2] Creating recovery files..."
+    # PAR2 for the resume path (skip if we just committed; the commit
+    # already published PAR2 from staging)
+    if (( ! staging_committed )); then
+      local par2_start par2_end
+      par2_start=$(date +%s)
+      _a2_print_log "[PAR2] Creating recovery files..."
 
-    local -a rel_parts=()
-    local p
-    for p in "${parts[@]}"; do
-      rel_parts+=("$(basename "$p")")
-    done
+      local -a rel_parts=()
+      local p
+      for p in "${parts[@]}"; do
+        rel_parts+=("$(basename "$p")")
+      done
 
-    local par2_cmd
-    par2_cmd=$(printf "par2 create -r10 %q " "${out}.par2"; printf "%q " "${rel_parts[@]}"; printf "%q" "$manifest")
+      local par2_cmd
+      par2_cmd=$(printf "par2 create -r10 %q " "${out}.par2"; printf "%q " "${rel_parts[@]}"; printf "%q" "$manifest")
 
-    if ! _a2_launch_job pid_par2 pgid_par2 bash -c 'script -q -f "$1" -c "$2"' _ "$par2_tty_file" "$par2_cmd"; then
-      _a2_print_log "ERROR: Failed to launch PAR2 job."
-      _a2_cleanup
-      return 1
+      if ! _a2_launch_job pid_par2 pgid_par2 bash -c 'script -q -f "$1" -c "$2"' _ "$par2_tty_file" "$par2_cmd"; then
+        _a2_print_log "ERROR: Failed to launch PAR2 job."
+        _a2_cleanup
+        return 1
+      fi
+
+      local par2_exit_status=1
+      if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
+        _a2_print_log "ERROR: Could not reliably reap PAR2 job."
+        _a2_cleanup
+        return 1
+      fi
+
+      if [[ -f "$par2_tty_file" ]]; then
+        tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
+      fi
+
+      (( abort_flag )) && { _a2_cleanup; return 1; }
+
+      if (( par2_exit_status != 0 )); then
+        par2_status="FAILED"
+        _a2_cleanup
+        return 1
+      fi
+
+      par2_end=$(date +%s)
+      t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
+      par2_status="SUCCESS"
     fi
-
-    local par2_exit_status=1
-    if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
-      _a2_print_log "ERROR: Could not reliably reap PAR2 job."
-      _a2_cleanup
-      return 1
-    fi
-
-    if [[ -f "$par2_tty_file" ]]; then
-      tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
-    fi
-
-    (( abort_flag )) && { _a2_cleanup; return 1; }
-
-    if (( par2_exit_status != 0 )); then
-      par2_status="FAILED"
-      _a2_cleanup
-      return 1
-    fi
-
-    par2_end=$(date +%s)
-    t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
-    par2_status="SUCCESS"
 
   else
     # ==================== MODO SINGLE FILE ====================
@@ -1447,18 +1585,27 @@ archivepar2 () {
     (( abort_flag )) && { _a2_cleanup; return 1; }
 
     if (( run_compression )); then
+      if ! _a2_create_staging "$backup_dir"; then
+        _a2_print_log "ERROR: failed to create staging directory"
+        _a2_cleanup
+        return 1
+      fi
+
+      local staging_manifest="$staging_dir/${out}.blake3"
+      local staging_status_file="$staging_dir/.status"
+      local staging_archive="$staging_dir/${out}.tar.zst"
+
       comp_start=$(date +%s)
-      echo "# Created: $(date '+%Y-%m-%d %H:%M:%S')" > "$manifest"
-      echo "1" > "$status_file"
+      echo "# Created: $(date '+%Y-%m-%d %H:%M:%S')" > "$staging_manifest"
+      echo "1" > "$staging_status_file"
 
       if ! _a2_launch_job pid_b3sum pgid_b3sum bash -c '
         set -o pipefail
         if b3sum < "$1" | awk -v target="$2" '\''{print $1 "  " target}'\'' >> "$3"; then
           echo "0" > "$4"
-        else
-          echo "1" > "$4"
+        else          echo "1" > "$4"
         fi
-      ' _ "$hash_fifo" "${out}.tar.zst" "$manifest" "$status_file"; then
+      ' _ "$hash_fifo" "${out}.tar.zst" "$staging_manifest" "$staging_status_file"; then
         _a2_print_log "ERROR: Failed to launch b3sum job."
         _a2_cleanup
         return 1
@@ -1468,9 +1615,9 @@ archivepar2 () {
 
       if ! _a2_launch_job pid_main_pipeline pgid_main_pipeline bash -c '
         set -o pipefail
-        zstd_cmd="tar -cf - -C '\''$1'\'' '\''$2'\'' | zstd -T0 -10 --long=27 -v --progress | tee '\''$4'\'' > '\''$5.tar.zst'\''"
+        zstd_cmd="tar -cf - -C '\''$1'\'' '\''$2'\'' | zstd -T0 -10 --long=27 -v --progress | tee '\''$4'\'' > '\''$5'\''"
         script -q -f "$3" -c "$zstd_cmd"
-      ' _ "$parent_dir" "$base" "$zstd_err_file" "$hash_fifo" "$out"; then
+      ' _ "$parent_dir" "$base" "$zstd_err_file" "$hash_fifo" "$staging_archive"; then
         _a2_print_log "ERROR: Failed to launch main compression pipeline job."
         _a2_cleanup
         return 1
@@ -1503,7 +1650,7 @@ archivepar2 () {
       fi
 
       local b3sum_file_status="MISSING"
-      [[ -f "$status_file" ]] && b3sum_file_status=$(< "$status_file")
+      [[ -f "$staging_status_file" ]] && b3sum_file_status=$(< "$staging_status_file")
 
       if [[ $b3sum_wait_status -ne 0 || "$b3sum_file_status" != "0" ]]; then
         _a2_print_log "ERROR: global BLAKE3 hashing process failed or did not complete successfully"
@@ -1511,7 +1658,7 @@ archivepar2 () {
         return 1
       fi
 
-      if ! _a2_validate_global_manifest; then
+      if ! _a2_validate_global_manifest "$staging_manifest"; then
         _a2_print_log "ERROR: BLAKE3 manifest missing or has invalid/duplicate/misplaced global archive entry"
         _a2_cleanup
         return 1
@@ -1528,7 +1675,9 @@ archivepar2 () {
         _a2_print_log "$zstd_golden_line"
       fi
 
-      _a2_show_manifest 
+      _a2_print_log "[BLAKE3 MANIFEST CONTENT]"
+      cat "$staging_manifest" >> "$logfile"
+      cat "$staging_manifest"
 
       comp_end=$(date +%s)
       t_compress_dur=$(_a2_format_duration $((comp_end - comp_start)))
@@ -1538,45 +1687,95 @@ archivepar2 () {
         _a2_cleanup
         return 1
       }
+
+      local par2_start par2_end
+      par2_start=$(date +%s)
+      _a2_print_log "[PAR2] Creating recovery files..."
+
+      local par2_cmd
+      par2_cmd=$(printf "par2 create -r10 %q %q %q" "${out}.par2" "${out}.tar.zst" "$(basename "$staging_manifest")")
+
+      if ! _a2_launch_job pid_par2 pgid_par2 bash -c '
+        cd "$1" || exit 1
+        script -q -f "$2" -c "$3"
+      ' _ "$staging_dir" "$par2_tty_file" "$par2_cmd"; then
+        _a2_print_log "ERROR: Failed to launch PAR2 job."
+        _a2_cleanup
+        return 1
+      fi
+
+      local par2_exit_status=1
+      if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
+        _a2_print_log "ERROR: Could not reliably reap PAR2 job."
+        _a2_cleanup
+        return 1
+      fi
+
+      if [[ -f "$par2_tty_file" ]]; then
+        tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
+      fi
+
+      (( abort_flag )) && { _a2_cleanup; return 1; }
+
+      if (( par2_exit_status != 0 )); then
+        par2_status="FAILED"
+        _a2_print_log "ERROR: PAR2 creation failed"
+        _a2_cleanup
+        return 1
+      fi
+
+      par2_end=$(date +%s)
+      t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
+      par2_status="SUCCESS"
+
+      if ! _a2_commit_staging "$staging_dir" "$backup_dir"; then
+        _a2_print_log "ERROR: commit failed; previous backup may be partially overwritten"
+        _a2_cleanup
+        return 1
+      fi
+
+      _a2_cleanup_staging
     fi
 
     (( abort_flag )) && { _a2_cleanup; return 1; }
 
-    local par2_start par2_end
-    par2_start=$(date +%s)
-    _a2_print_log "[PAR2] Creating recovery files..."
+    if (( ! staging_committed )); then
+      local par2_start par2_end
+      par2_start=$(date +%s)
+      _a2_print_log "[PAR2] Creating recovery files..."
 
-    local par2_cmd
-    par2_cmd=$(printf "par2 create -r10 %q %q %q" "${out}.par2" "${out}.tar.zst" "$manifest")
+      local par2_cmd
+      par2_cmd=$(printf "par2 create -r10 %q %q %q" "${out}.par2" "${out}.tar.zst" "$manifest")
 
-    if ! _a2_launch_job pid_par2 pgid_par2 bash -c 'script -q -f "$1" -c "$2"' _ "$par2_tty_file" "$par2_cmd"; then
-      _a2_print_log "ERROR: Failed to launch PAR2 job."
-      _a2_cleanup
-      return 1
+      if ! _a2_launch_job pid_par2 pgid_par2 bash -c 'script -q -f "$1" -c "$2"' _ "$par2_tty_file" "$par2_cmd"; then
+        _a2_print_log "ERROR: Failed to launch PAR2 job."
+        _a2_cleanup
+        return 1
+      fi
+
+      local par2_exit_status=1
+      if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
+        _a2_print_log "ERROR: Could not reliably reap PAR2 job."
+        _a2_cleanup
+        return 1
+      fi
+
+      if [[ -f "$par2_tty_file" ]]; then
+        tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
+      fi
+
+      (( abort_flag )) && { _a2_cleanup; return 1; }
+
+      if (( par2_exit_status != 0 )); then
+        par2_status="FAILED"
+        _a2_cleanup
+        return 1
+      fi
+
+      par2_end=$(date +%s)
+      t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
+      par2_status="SUCCESS"
     fi
-
-    local par2_exit_status=1
-    if ! _a2_reap_job pid_par2 pgid_par2 par2_exit_status; then
-      _a2_print_log "ERROR: Could not reliably reap PAR2 job."
-      _a2_cleanup
-      return 1
-    fi
-
-    if [[ -f "$par2_tty_file" ]]; then
-      tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[JKmsu]//g' | grep -v -E '[0-9]+\.[0-9]%|Opening:|Processing:|Constructing:' >> "$logfile"
-    fi
-
-    (( abort_flag )) && { _a2_cleanup; return 1; }
-
-    if (( par2_exit_status != 0 )); then
-      par2_status="FAILED"
-      _a2_cleanup
-      return 1
-    fi
-
-    par2_end=$(date +%s)
-    t_par2_dur=$(_a2_format_duration $((par2_end - par2_start)))
-    par2_status="SUCCESS"
   fi
 
   if (( abort_flag )); then
