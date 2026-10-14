@@ -1,5 +1,5 @@
-# Version Details: v0.64
-# Fix: Implemented temporary job control disablement via set +m inside job launcher to completely wipe out interactive terminal job notifications ([1] PID / Done).
+# Version Details: v0.16.2
+# Fix: Cleaned up hidden control characters and fixed log extraction.
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
     echo "Error: no input folder provided" >&2
@@ -74,6 +74,14 @@ archivepar2 () {
   zstd_err_file=$(mktemp /tmp/archivepar2_zstd_err_XXX.log) || {
     echo "ERROR: failed to create zstd error temp file" >&2
     rm -rf "$fifo_dir" "$status_file"
+    return 1
+  }
+
+  local par2_tty_file
+  par2_tty_file=$(mktemp /tmp/archivepar2_par2_tty_XXX.log) || {
+    echo "ERROR: failed to create par2 tty temp file" >&2
+    rm -f "$zstd_err_file"
+    rm -rf "$fifo_dir" "$status_file"
     _a2_init_fail
     return 1
   }
@@ -81,7 +89,7 @@ archivepar2 () {
   local resume_out_file
   resume_out_file=$(mktemp /tmp/archivepar2_resume_out_XXX.dat) || {
     echo "ERROR: failed to create resume output temp file" >&2
-    rm -f "$zstd_err_file" "$status_file"
+    rm -f "$zstd_err_file" "$par2_tty_file" "$status_file"
     rm -rf "$fifo_dir"
     _a2_init_fail
     return 1
@@ -172,7 +180,7 @@ archivepar2 () {
     done
 
     local f
-    for f in "$zstd_err_file" "$status_file" "$resume_out_file"; do
+    for f in "$zstd_err_file" "$par2_tty_file" "$status_file" "$resume_out_file"; do
       if [[ -f "$f" ]]; then
         rm -f "$f" 2>/dev/null || true
         [[ -f "$f" ]] && cleanup_failed=1
@@ -279,13 +287,12 @@ archivepar2 () {
     printf "%02d:%02d" $((sec / 60)) $((sec % 60))
   }
 
-  _a2_print_log "=============================="
-  _a2_print_log "Archiving: $arch"
-  _a2_print_log "Working dir: $backup_dir"
-  _a2_print_log "Output base: $out"
-  _a2_print_log "=============================="
+  echo "==============================="
+  echo "Archiving: $arch"
+  echo "Working dir: $backup_dir"
+  echo "Output base: $out"
+  echo "==============================="
 
-  # Lançamento atômico blindado com set +m para supressão total de mensagens de controle de tarefas do shell
   _a2_launch_job() {
     local _a2_target_pid="$1"
     local _a2_target_pgid="$2"
@@ -295,7 +302,6 @@ archivepar2 () {
     _a2_pgid_file=$(mktemp "$fifo_dir/pgid_XXX.dat") || return 1
     _a2_ack_file=$(mktemp -u "$fifo_dir/ack_XXX.dat") || { rm -f "$_a2_pgid_file"; return 1; }
 
-    local _a2_child_pid
     {
       set +m
       setsid -w bash -c '
@@ -310,7 +316,7 @@ archivepar2 () {
         shift 2
         exec "$@"
       ' _ "$_a2_pgid_file" "$_a2_ack_file" "$@" &
-      _a2_child_pid=$!
+      local _a2_child_pid=$!
     } 2>/dev/null
 
     local _a2_captured_pgid=""
@@ -923,7 +929,16 @@ archivepar2 () {
     par2_start=$(date +%s)
     _a2_print_log "[PAR2] Creating recovery files..."
 
-    if ! _a2_launch_job pid_par2 pgid_par2 par2 create -r10 "${out}.par2" "${parts[@]}" "$manifest"; then
+    local -a rel_parts=()
+    local p
+    for p in "${parts[@]}"; do
+      rel_parts+=("$(basename "$p")")
+    done
+
+    local par2_cmd
+    par2_cmd=$(printf "par2 create -r10 %q " "${out}.par2"; printf "%q " "${rel_parts[@]}"; printf "%q" "$manifest")
+
+    if ! _a2_launch_job pid_par2 pgid_par2 bash -c 'script -q -f "$1" -c "$2"' _ "$par2_tty_file" "$par2_cmd"; then
       _a2_print_log "ERROR: Failed to launch PAR2 job."
       _a2_cleanup
       return 1
@@ -934,6 +949,10 @@ archivepar2 () {
       _a2_print_log "ERROR: Could not reliably reap PAR2 job."
       _a2_cleanup
       return 1
+    fi
+
+    if [[ -f "$par2_tty_file" ]]; then
+      tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[a-zA-Z]//g; s/\r/\n/g' | grep -vE '(%|Constructing:|Processing:|Opening:)' >> "$logfile"
     fi
 
     (( abort_flag )) && { _a2_cleanup; return 1; }
@@ -1085,7 +1104,10 @@ archivepar2 () {
     par2_start=$(date +%s)
     _a2_print_log "[PAR2] Creating recovery files..."
 
-    if ! _a2_launch_job pid_par2 pgid_par2 par2 create -r10 "${out}.par2" "${out}.tar.zst" "$manifest"; then
+    local par2_cmd
+    par2_cmd=$(printf "par2 create -r10 %q %q %q" "${out}.par2" "${out}.tar.zst" "$manifest")
+
+    if ! _a2_launch_job pid_par2 pgid_par2 bash -c 'script -q -f "$1" -c "$2"' _ "$par2_tty_file" "$par2_cmd"; then
       _a2_print_log "ERROR: Failed to launch PAR2 job."
       _a2_cleanup
       return 1
@@ -1096,6 +1118,10 @@ archivepar2 () {
       _a2_print_log "ERROR: Could not reliably reap PAR2 job."
       _a2_cleanup
       return 1
+    fi
+
+    if [[ -f "$par2_tty_file" ]]; then
+      tr '\r' '\n' < "$par2_tty_file" | sed 's/\x1B\[[0-9;]*[a-zA-Z]//g; s/\r/\n/g' | grep -vE '(%|Constructing:|Processing:|Opening:)' >> "$logfile"
     fi
 
     (( abort_flag )) && { _a2_cleanup; return 1; }
