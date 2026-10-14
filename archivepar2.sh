@@ -1,5 +1,5 @@
-# Version Details: v0.15.41
-# Fix: Unified bounded launch cleanup on ACK failure, fail-closed handling on forced SIGKILL of lingering processes, pragmatic POSIX PID mitigation documentation, and closing Issue #1.
+# Version Details: v0.15.42
+# Fix: Post-SIGKILL group confirmation in _a2_launch_job failure path; orphaned PGIDs registered in _a2_orphan_pgids array so _a2_cleanup can retry termination.
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
     echo "Error: no input folder provided" >&2
@@ -104,6 +104,7 @@ archivepar2 () {
   local pgid_check="" pid_check=""
   local pgid_resume="" pid_resume=""
   local _a2_cleaned=0
+  local -a _a2_orphan_pgids=()
 
   local _a2_old_trap_int _a2_old_trap_term
   _a2_old_trap_int=$(trap -p INT)
@@ -133,6 +134,29 @@ archivepar2 () {
           fi
         fi
         if kill -0 -- -"$local_pgid" 2>/dev/null; then
+          cleanup_failed=1
+        fi
+      fi
+    done
+
+    # Processos cujo grupo não pôde ser confirmado encerrado durante _a2_launch_job (falha de lançamento)
+    # são registrados em _a2_orphan_pgids e tentados aqui com o mesmo protocolo TERM→poll→KILL.
+    local _a2_op
+    for _a2_op in "${_a2_orphan_pgids[@]+"${_a2_orphan_pgids[@]}"}"; do
+      if [[ -n "$_a2_op" ]] && [[ "$_a2_op" =~ ^[0-9]+$ ]]; then
+        if kill -0 -- -"$_a2_op" 2>/dev/null; then
+          kill -TERM -- -"$_a2_op" 2>/dev/null || true
+          local _a2_op_count=0
+          while kill -0 -- -"$_a2_op" 2>/dev/null && (( _a2_op_count < 30 )); do
+            sleep 0.1
+            (( ++_a2_op_count ))
+          done
+          if kill -0 -- -"$_a2_op" 2>/dev/null; then
+            kill -KILL -- -"$_a2_op" 2>/dev/null || true
+            sleep 0.1
+          fi
+        fi
+        if kill -0 -- -"$_a2_op" 2>/dev/null; then
           cleanup_failed=1
         fi
       fi
@@ -350,6 +374,23 @@ archivepar2 () {
       fi
 
       wait "$_a2_child_pid" 2>/dev/null || true
+
+      # Confirmação pós-SIGKILL: verificar se o grupo também terminou.
+      # Se o PGID foi validado e o grupo ainda está ativo após o SIGKILL ao wrapper,
+      # aguardamos um intervalo limitado antes de registrar como órfão.
+      if (( _a2_g_active )); then
+        local _a2_conf_c=0
+        while kill -0 -- -"${_a2_captured_pgid}" 2>/dev/null && (( _a2_conf_c < 10 )); do
+          sleep 0.05
+          (( ++_a2_conf_c ))
+        done
+        if kill -0 -- -"${_a2_captured_pgid}" 2>/dev/null; then
+          # Grupo ainda ativo após SIGKILL e período de tolerância.
+          # Registra o PGID para que _a2_cleanup possa tentar encerrar o grupo na limpeza geral.
+          _a2_orphan_pgids+=("${_a2_captured_pgid}")
+          echo "WARNING: process group ${_a2_captured_pgid} may still be active after launch failure cleanup" >&2
+        fi
+      fi
       return 1
     fi
 
