@@ -1,16 +1,16 @@
-# Version Details: v0.16.3.2b
-# Change:
-#   - Use $BASHPID instead of $$ for the lock owner PID. $$ returns the PID
-#     of the parent shell (the interactive shell), not the subshell running
-#     archivepar2 when invoked with '&'. $BASHPID is the actual PID of the
-#     bash process executing the function.
-#   - Remove fuser(1) from the lock-held diagnostic. fuser lists every process
-#     that has the lock file open, including the current process (which opens
-#     the fd before attempting flock). This produced wrong or misleading PIDs.
-#     We now read the owner PID from lockdir/pid, which the holder writes
-#     atomically after acquiring the lock. In the rare race where the holder
-#     has not yet written it, the diagnostic degrades to "PID : ?".
-#   - _a2_release_lock compares against $BASHPID for the same reason.
+# Version Details: v0.16.3.3.1a
+# Change: Staging infrastructure only (additive, no functional change).
+#   - Added _a2_remove_orphan_stagings, _a2_create_staging,
+#     _a2_commit_staging, _a2_cleanup_staging.
+#   - _a2_update_parts_array now accepts an optional directory argument
+#     (defaults to $staging_dir if present, else $backup_dir). parts still
+#     contains basenames; the working directory remains $backup_dir.
+#   - _a2_print_log and _a2_format_duration moved earlier in the function
+#     so staging helpers can log.
+#   - _a2_cleanup calls _a2_cleanup_staging after _a2_release_lock.
+#   - _a2_remove_orphan_stagings called right after lock acquisition.
+#   - The compression pipeline still writes to $backup_dir. Migration to
+#     staging happens in v0.16.3.3.1b.
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
     echo "Error: no input folder provided" >&2
@@ -130,6 +130,7 @@ archivepar2 () {
   _a2_cleanup() {
     _a2_in_cleanup=1
     _a2_release_lock 2>/dev/null || true
+    _a2_cleanup_staging 2>/dev/null || true
 
     local cleanup_failed=0
     local local_pgid local_pid
@@ -220,7 +221,9 @@ archivepar2 () {
                _a2_verify_manifest_split _a2_validate_global_manifest _a2_cleanup \
                _a2_handle_signal _a2_init_fail _a2_restore_traps _a2_launch_job _a2_reap_job \
                _a2_detect_layout _a2_resolve_active_dir _a2_log_layout_diagnostics \
-               _a2_check_same_filesystem _a2_acquire_lock _a2_release_lock 2>/dev/null || true
+               _a2_check_same_filesystem _a2_acquire_lock _a2_release_lock \
+               _a2_remove_orphan_stagings _a2_create_staging _a2_commit_staging \
+               _a2_cleanup_staging 2>/dev/null || true
     else
       return 1
     fi
@@ -302,6 +305,13 @@ archivepar2 () {
   local lock_acquired=0
   local lock_fs_type=""
 
+  # ============================================================
+  # v0.16.3.3.1a — Staging variables
+  # ============================================================
+  local staging_dir=""
+  local staging_committed=0
+  local run_id="$$.$RANDOM.$(date +%s)"
+
   echo "==================================================" > "$logfile"
   echo "             ARCHIVEPAR2 SESSION LOG             " >> "$logfile"
   echo "==================================================" >> "$logfile"
@@ -310,9 +320,12 @@ archivepar2 () {
   echo "Output Base Name: $out" >> "$logfile"
   echo "Target Directory: $backup_dir" >> "$logfile"
   echo "Arguments Used  : Single Mode=$single_mode | Fast Mode=$fast_mode | Max Size=$maxsize" >> "$logfile"
-  echo "Version         : v0.16.3.2b" >> "$logfile"
+  echo "Version         : v0.16.3.3.1a" >> "$logfile"
   echo "--------------------------------------------------" >> "$logfile"
 
+  # ============================================================
+  # Logging helpers (moved earlier so staging helpers can log)
+  # ============================================================
   _a2_print_log() {
     echo -e "$@" | tee -a "$logfile"
   }
@@ -427,6 +440,122 @@ archivepar2 () {
   }
 
   # ============================================================
+  # v0.16.3.3.1a — Staging infrastructure
+  # ============================================================
+  #
+  # The staging directory isolates in-progress generation from the
+  # active backup. Nothing is published to $backup_dir until
+  # _a2_commit_staging runs. If generation fails, the staging dir is
+  # removed and the previous backup remains intact.
+  #
+  # Staging lives inside $backup_dir (same filesystem) so that the
+  # commit can use rename(2), which is atomic and does not copy data.
+  #
+  # In v0.16.3.3.1a these helpers are NOT yet used by the generation
+  # pipeline. The only function called is _a2_remove_orphan_stagings,
+  # which cleans up leftovers from prior interrupted runs. Migration
+  # of the pipeline to staging happens in v0.16.3.3.1b.
+  #
+  _a2_remove_orphan_stagings() {
+    local target="$1"
+    local orig_nullglob=0
+    [[ -o nullglob ]] && orig_nullglob=1
+    shopt -s nullglob
+
+    local -a orphans=( "$target"/.staging.* )
+    (( orig_nullglob )) || shopt -u nullglob
+
+    local o
+    for o in "${orphans[@]}"; do
+      [[ -d "$o" ]] || continue
+      local base
+      base=$(basename "$o")
+      # Format: .staging.<pid>.<random>.<timestamp>
+      local pid_part
+      pid_part=$(printf '%s' "$base" | awk -F. '{print $3}')
+      if [[ "$pid_part" =~ ^[0-9]+$ ]] && kill -0 "$pid_part" 2>/dev/null; then
+        _a2_print_log "[STAGING] Active staging of PID $pid_part found (not an orphan): $base"
+        continue
+      fi
+      _a2_print_log "[STAGING] Removing orphan staging directory: $base"
+      rm -rf "$o" 2>/dev/null || {
+        _a2_print_log "[STAGING] WARN: could not remove orphan staging: $o"
+      }
+    done
+  }
+
+  _a2_create_staging() {
+    local target="$1"
+    staging_dir="$target/.staging.${run_id}"
+
+    if ! mkdir "$staging_dir" 2>/dev/null; then
+      _a2_print_log "[STAGING] ERROR: cannot create staging directory '$staging_dir'"
+      return 1
+    fi
+
+    if ! _a2_check_same_filesystem "$staging_dir" "$target"; then
+      _a2_print_log "[STAGING] ERROR: staging and backup are on different filesystems"
+      _a2_print_log "[STAGING]         staging: $staging_dir"
+      _a2_print_log "[STAGING]         backup : $target"
+      _a2_print_log "[STAGING]         commit would require copying data (not supported)"
+      rm -rf "$staging_dir" 2>/dev/null || true
+      staging_dir=""
+      return 1
+    fi
+
+    _a2_print_log "[STAGING] Created staging directory: $(basename "$staging_dir")"
+    return 0
+  }
+
+  _a2_commit_staging() {
+    local staging="$1"
+    local target="$2"
+
+    [[ -d "$staging" ]] || {
+      _a2_print_log "[COMMIT] ERROR: staging directory does not exist: $staging"
+      return 1
+    }
+
+    _a2_print_log "[COMMIT] Publishing staging to $target..."
+
+    local orig_nullglob=0
+    [[ -o nullglob ]] && orig_nullglob=1
+    shopt -s nullglob
+
+    local -a files=( "$staging"/* "$staging"/.[!.]* "$staging"/..?* )
+    (( orig_nullglob )) || shopt -u nullglob
+
+    local f base
+    local moved=0
+    for f in "${files[@]}"; do
+      [[ -e "$f" ]] || continue
+      base=$(basename "$f")
+      if ! mv -f "$f" "$target/$base" 2>/dev/null; then
+        _a2_print_log "[COMMIT] ERROR: failed to publish '$base'"
+        return 1
+      fi
+      (( ++moved ))
+    done
+
+    _a2_print_log "[COMMIT] Published $moved file(s)."
+    staging_committed=1
+    return 0
+  }
+
+  _a2_cleanup_staging() {
+    [[ -n "$staging_dir" ]] || return 0
+    [[ -d "$staging_dir" ]] || return 0
+    if (( staging_committed )); then
+      rm -rf "$staging_dir" 2>/dev/null || true
+    else
+      _a2_print_log "[STAGING] Removing uncommitted staging directory: $(basename "$staging_dir")"
+      rm -rf "$staging_dir" 2>/dev/null || true
+    fi
+    staging_dir=""
+    return 0
+  }
+
+  # ============================================================
   # v0.16.3.2 / v0.16.3.2b — Layered locking
   # ============================================================
   _a2_acquire_lock() {
@@ -439,17 +568,12 @@ archivepar2 () {
         ;;
     esac
 
-    # --- Layer 1: flock ---
     if command -v flock >/dev/null 2>&1; then
       exec {lock_fd}>"$lock_file" || {
         _a2_print_log "[LOCK] ERROR: cannot open lock file '$lock_file'"
         return 1
       }
       if ! flock -n "$lock_fd"; then
-        # Lock is held by another process. Read owner metadata from
-        # lockdir/pid. In the rare race where the holder has acquired
-        # flock but has not yet written its lockdir metadata, this
-        # degrades to "PID : ?".
         local holder_pid="" holder_time="" holder_cmd=""
         if [[ -d "$lock_dir" ]]; then
           holder_pid=$(cat "$lock_dir/pid" 2>/dev/null)
@@ -467,7 +591,6 @@ archivepar2 () {
       fi
     fi
 
-    # --- Layer 2: mkdir lockdir (universal) ---
     if ! mkdir "$lock_dir" 2>/dev/null; then
       local holder_pid holder_time holder_cmd holder_alive=0
       holder_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
@@ -517,12 +640,6 @@ archivepar2 () {
       fi
     fi
 
-    # --- Layer 3: metadata inside lockdir ---
-    #
-    # $BASHPID is used instead of $$ so that the recorded PID is the
-    # actual bash process running this function. When invoked as
-    # 'archivepar2 mydata &', $$ returns the parent shell's PID, not
-    # the subshell's. $BASHPID is correct in both cases.
     echo "$BASHPID" > "$lock_dir/pid" 2>/dev/null || true
     date '+%Y-%m-%d %H:%M:%S' > "$lock_dir/time" 2>/dev/null || true
     if [[ -r "/proc/$BASHPID/cmdline" ]]; then
@@ -539,8 +656,6 @@ archivepar2 () {
   _a2_release_lock() {
     (( lock_acquired )) || return 0
 
-    # Remove lockdir if we own it. Compare against $BASHPID (not $$),
-    # matching what _a2_acquire_lock wrote.
     if [[ -d "$lock_dir" ]]; then
       local owner_pid=""
       owner_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
@@ -564,7 +679,7 @@ archivepar2 () {
     # backup_dir use the same inode. The file is 0 bytes and is
     # filtered out of the parts glob by its leading dot.
     #
-    # v0.16.3.2c will relocate this file to $XDG_RUNTIME_DIR to
+    # v0.16.3.3.2 will relocate this file to $XDG_RUNTIME_DIR to
     # eliminate the visual clutter without reintroducing the race.
     if command -v flock >/dev/null 2>&1; then
       exec {lock_fd}>&- 2>/dev/null || true
@@ -578,6 +693,11 @@ archivepar2 () {
     _a2_cleanup
     return 1
   fi
+
+  # Clean up orphan staging directories from prior interrupted runs
+  # (safe: runs only after lock acquisition, so no concurrent staging
+  # of the same backup_dir can be active).
+  _a2_remove_orphan_stagings "$backup_dir"
 
   echo "==============================="
   echo "Archiving: $arch"
@@ -828,12 +948,38 @@ archivepar2 () {
     return $status
   }
 
+  # ============================================================
+  # v0.16.3.3.1a — _a2_update_parts_array parametrized by directory
+  # ============================================================
+  # Accepts an optional directory argument. If empty, uses $staging_dir
+  # if it exists, else $backup_dir. parts is filled with BASENAMES, so
+  # callers continue to work as before (using $PWD = $backup_dir for
+  # relative resolution). The directory argument only controls where
+  # the glob reads from.
+  #
   _a2_update_parts_array() {
+    local where="${1:-}"
+    if [[ -z "$where" ]]; then
+      if [[ -n "$staging_dir" ]] && [[ -d "$staging_dir" ]]; then
+        where="$staging_dir"
+      else
+        where="$backup_dir"
+      fi
+    fi
+
     local orig_nullglob=0
     [[ -o nullglob ]] && orig_nullglob=1
     shopt -s nullglob
-    parts=( "${out}.tar.zst.part-"* )
+
+    local -a raw=( "$where"/${out}.tar.zst.part-* )
     (( orig_nullglob )) || shopt -u nullglob
+
+    parts=()
+    local f
+    for f in "${raw[@]}"; do
+      [[ -e "$f" ]] || continue
+      parts+=( "$(basename "$f")" )
+    done
   }
 
   _a2_show_manifest() {
