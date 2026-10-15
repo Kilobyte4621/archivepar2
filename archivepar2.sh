@@ -1,6 +1,8 @@
-# Version Details: v0.17-rc1
-# Change: Versioned layout with atomic symlink swap; PAR2 resume path fix;
-#         --no-migrate keeps legacy commit.
+# Version Details: v0.17-rc1.0.2
+# Change (from v0.17-rc1.0.1):
+# Reuse of _a2_init_fail: In argument errors and --keep, we exchange repeated pipefail restore lines for a clean call to _a2_init_fail.
+# Compression of the allocation: The temporary files are now created sequentially and cleanly, grouping the cleaning of previous files directly on the keys ||.
+
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
     echo "Error: no input folder provided" >&2
@@ -29,6 +31,12 @@ archivepar2 () {
 
   t_start=$(date +%s)
 
+  _a2_init_fail() {
+    (( _a2_orig_pipefail )) || set +o pipefail
+    cd "$oldpwd" >/dev/null 2>&1
+    return 1
+  }
+
   while [[ $# -gt 0 ]]; do
     local current_arg="${1^^}"
     case "$current_arg" in
@@ -39,7 +47,7 @@ archivepar2 () {
         shift
         if [[ -z "${1:-}" ]] || ! [[ "$1" =~ ^[0-9]+$ ]]; then
           echo "ERROR: --keep requires a non-negative integer" >&2
-          (( _a2_orig_pipefail )) || set +o pipefail
+          _a2_init_fail
           return 1
         fi
         keep_versions="$1"
@@ -50,7 +58,7 @@ archivepar2 () {
           maxsize="$current_arg"
         else
           echo "ERROR: invalid argument: $1" >&2
-          (( _a2_orig_pipefail )) || set +o pipefail
+          _a2_init_fail
           return 1
         fi
         ;;
@@ -62,60 +70,18 @@ archivepar2 () {
     keep_versions="$ARCHIVEPAR2_KEEP"
   fi
 
-  _a2_init_fail() {
-    (( _a2_orig_pipefail )) || set +o pipefail
-    cd "$oldpwd" >/dev/null 2>&1
-    return 1
-  }
+  # --- Alocação Unificada de Temporários (Mais Enxuta) ---
+  local status_file fifo_dir hash_fifo zstd_err_file par2_tty_file resume_out_file
 
-  local status_file
-  status_file=$(mktemp /tmp/archivepar2_status_XXX.dat) || {
-    echo "ERROR: failed to create temporary status file" >&2
-    _a2_init_fail
-    return 1
-  }
+  status_file=$(mktemp /tmp/archivepar2_status_XXX.dat) || { echo "ERROR: failed to create temporary status file" >&2; _a2_init_fail; return 1; }
+  fifo_dir=$(mktemp -d /tmp/archivepar2_fifo_dir_XXX) || { rm -f "$status_file"; _a2_init_fail; return 1; }
+  
+  hash_fifo="$fifo_dir/hash.fifo"
+  mkfifo "$hash_fifo" || { rm -rf "$fifo_dir" "$status_file"; _a2_init_fail; return 1; }
 
-  local fifo_dir
-  fifo_dir=$(mktemp -d /tmp/archivepar2_fifo_dir_XXX) || {
-    echo "ERROR: failed to create temporary FIFO directory" >&2
-    rm -f "$status_file"
-    _a2_init_fail
-    return 1
-  }
-
-  local hash_fifo="$fifo_dir/hash.fifo"
-  mkfifo "$hash_fifo" || {
-    echo "ERROR: failed to create FIFO" >&2
-    rm -rf "$fifo_dir" "$status_file"
-    _a2_init_fail
-    return 1
-  }
-
-  local zstd_err_file
-  zstd_err_file=$(mktemp /tmp/archivepar2_zstd_err_XXX.log) || {
-    echo "ERROR: failed to create zstd error temp file" >&2
-    rm -rf "$fifo_dir" "$status_file"
-    _a2_init_fail
-    return 1
-  }
-
-  local par2_tty_file
-  par2_tty_file=$(mktemp /tmp/archivepar2_par2_tty_XXX.log) || {
-    echo "ERROR: failed to create par2 tty temp file" >&2
-    rm -f "$zstd_err_file"
-    rm -rf "$fifo_dir" "$status_file"
-    _a2_init_fail
-    return 1
-  }
-
-  local resume_out_file
-  resume_out_file=$(mktemp /tmp/archivepar2_resume_out_XXX.dat) || {
-    echo "ERROR: failed to create resume output temp file" >&2
-    rm -f "$zstd_err_file" "$par2_tty_file" "$status_file"
-    rm -rf "$fifo_dir"
-    _a2_init_fail
-    return 1
-  }
+  zstd_err_file=$(mktemp /tmp/archivepar2_zstd_err_XXX.log) || { rm -rf "$fifo_dir" "$status_file"; _a2_init_fail; return 1; }
+  par2_tty_file=$(mktemp /tmp/archivepar2_par2_tty_XXX.log) || { rm -f "$zstd_err_file"; rm -rf "$fifo_dir" "$status_file"; _a2_init_fail; return 1; }
+  resume_out_file=$(mktemp /tmp/archivepar2_resume_out_XXX.dat) || { rm -f "$zstd_err_file" "$par2_tty_file"; rm -rf "$fifo_dir" "$status_file"; _a2_init_fail; return 1; }
 
   local abort_flag=0
   local pgid_b3sum="" pid_b3sum=""
@@ -236,7 +202,7 @@ archivepar2 () {
                _a2_cleanup_staging _a2_prune_obsolete_parts \
                _a2_is_versioned_layout _a2_generate_version_name \
                _a2_migrate_legacy_to_versioned _a2_commit_versioned \
-               _a2_prune_old_versions 2>/dev/null || true
+               _a2_prune_old_versions _a2_extract_global_hash 2>/dev/null || true
     else
       return 1
     fi
@@ -331,7 +297,7 @@ archivepar2 () {
   echo "Output Base Name: $out" >> "$logfile"
   echo "Target Directory: $backup_dir" >> "$logfile"
   echo "Arguments Used  : Single Mode=$single_mode | Fast Mode=$fast_mode | Max Size=$maxsize | Keep=$keep_versions | No-Migrate=$no_migrate" >> "$logfile"
-  echo "Version         : v0.17-rc1" >> "$logfile"
+  echo "Version         : v0.17-rc1.0.1" >> "$logfile"
   echo "--------------------------------------------------" >> "$logfile"
 
   _a2_print_log() {
@@ -1149,13 +1115,26 @@ archivepar2 () {
     cat "$m_file"
   }
 
-  _a2_verify_manifest_single() {
-    local stored current
-    local active_manifest="$active_dir/${out}.blake3"
-    [[ -f "$active_manifest" ]] || return 10
-    stored=$(awk -v target="${out}.tar.zst" '
+  # _a2_extract_global_hash <manifest_file> <target_name>
+  #
+  # Ecoa o hash BLAKE3 da entrada global de <target_name> em stdout (se válido).
+  # Retorna:
+  #   0  = entrada encontrada, válida e única; hash ecoado em stdout
+  #   10 = entrada ausente (manifest vazio, ou sem entrada para target)
+  #   11 = entrada malformada / duplicada / target no campo errado
+  #   4  = erro de I/O ou sintaxe no manifest (awk falhou)
+  #
+  # Não loga nada. O chamador decide como reportar.
+  _a2_extract_global_hash() {
+    local m_file="$1"
+    local target_name="$2"
+
+    [[ -f "$m_file" ]] || return 10
+
+    local result
+    result=$(awk -v target="$target_name" '
       BEGIN { count = 0; malformed_pos = 0; invalid = 0; valid_hash = "" }
-      $0 ~ /^#/ { next }
+      /^[[:space:]]*#/ { next }
       NF == 0 { next }
       {
         if ($2 == target) {
@@ -1172,24 +1151,43 @@ archivepar2 () {
         }
       }
       END {
-        if (malformed_pos) exit 11;
-        if (count == 0) exit 10;
-        if (count > 1 || invalid) exit 11;
-        print valid_hash;
-        exit 0;
+        if (malformed_pos) exit 11
+        if (count == 0) exit 10
+        if (count > 1 || invalid) exit 11
+        print valid_hash
+        exit 0
       }
-    ' "$active_manifest")
-    local awk_status=$?
-    if (( awk_status == 10 )); then
-      return 10
-    elif (( awk_status == 11 )); then
-      _a2_print_log "ERROR: Manifest contains duplicate, malformed, or misplaced global entry for target."
-      return 3
-    elif (( awk_status != 0 )); then
-      _a2_print_log "ERROR: Failed to read or parse manifest file due to I/O or syntax error."
-      return 4
-    fi
-    [[ -z "$stored" ]] && return 10
+    ' "$m_file")
+    local rc=$?
+
+    case $rc in
+      0)
+        [[ -n "$result" ]] || return 10
+        printf '%s\n' "$result"
+        return 0
+        ;;
+      10) return 10 ;;
+      11) return 11 ;;
+      *)  return 4  ;;
+    esac
+  }
+
+  _a2_verify_manifest_single() {
+    local active_manifest="$active_dir/${out}.blake3"
+    local stored
+
+    stored=$(_a2_extract_global_hash "$active_manifest" "${out}.tar.zst")
+    local v_status=$?
+
+    case $v_status in
+      0)  : ;;
+      10) return 10 ;;
+      11) _a2_print_log "ERROR: Manifest contains duplicate, malformed, or misplaced global entry for target."
+          return 3 ;;
+      *)  _a2_print_log "ERROR: Failed to read or parse manifest file due to I/O or syntax error."
+          return 4 ;;
+    esac
+
     : > "$resume_out_file"
     if ! _a2_launch_job pid_resume pgid_resume bash -c '
       set -o pipefail
@@ -1207,6 +1205,7 @@ archivepar2 () {
       _a2_print_log "ERROR: Failed to compute hash for existing archive during resume."
       return 4
     fi
+    local current
     current=$(< "$resume_out_file")
     [[ -n "$current" ]] || return 4
     _a2_print_log "[BLAKE3] Stored Global : $stored"
@@ -1215,46 +1214,21 @@ archivepar2 () {
   }
 
   _a2_verify_manifest_split() {
-    local stored current
     local active_manifest="$active_dir/${out}.blake3"
-    [[ -f "$active_manifest" ]] || return 10
-    stored=$(awk -v target="${out}.tar.zst" '
-      BEGIN { count = 0; malformed_pos = 0; invalid = 0; valid_hash = "" }
-      $0 ~ /^#/ { next }
-      NF == 0 { next }
-      {
-        if ($2 == target) {
-          count++
-          if (NF == 2 && length($1) == 64 && $1 ~ /^[0-9a-fA-F]+$/) {
-            valid_hash = $1
-          } else {
-            invalid = 1
-          }
-        } else {
-          for (i = 1; i <= NF; i++) {
-            if ($i == target) malformed_pos = 1
-          }
-        }
-      }
-      END {
-        if (malformed_pos) exit 11;
-        if (count == 0) exit 10;
-        if (count > 1 || invalid) exit 11;
-        print valid_hash;
-        exit 0;
-      }
-    ' "$active_manifest")
-    local awk_status=$?
-    if (( awk_status == 10 )); then
-      return 10
-    elif (( awk_status == 11 )); then
-      _a2_print_log "ERROR: Manifest contains duplicate, malformed, or misplaced global entry for target."
-      return 3
-    elif (( awk_status != 0 )); then
-      _a2_print_log "ERROR: Failed to read or parse manifest file due to I/O or syntax error."
-      return 4
-    fi
-    [[ -z "$stored" ]] && return 10
+    local stored
+
+    stored=$(_a2_extract_global_hash "$active_manifest" "${out}.tar.zst")
+    local v_status=$?
+
+    case $v_status in
+      0)  : ;;
+      10) return 10 ;;
+      11) _a2_print_log "ERROR: Manifest contains duplicate, malformed, or misplaced global entry for target."
+          return 3 ;;
+      *)  _a2_print_log "ERROR: Failed to read or parse manifest file due to I/O or syntax error."
+          return 4 ;;
+    esac
+
     : > "$resume_out_file"
     if command -v pv >/dev/null 2>&1; then
       if ! _a2_launch_job pid_resume pgid_resume bash -c '
@@ -1286,6 +1260,7 @@ archivepar2 () {
       _a2_print_log "ERROR: Failed to read/compute hash of split parts during resume."
       return 4
     fi
+    local current
     current=$(< "$resume_out_file")
     [[ -n "$current" ]] || return 4
     _a2_print_log "[BLAKE3] Stored Global : $stored"
@@ -1295,29 +1270,7 @@ archivepar2 () {
 
   _a2_validate_global_manifest() {
     local m_file="${1:-$manifest}"
-    local target_name="${out}.tar.zst"
-    [[ -f "$m_file" ]] || return 1
-    awk -v target="$target_name" '
-      BEGIN { count = 0; malformed_pos = 0; invalid = 0 }
-      $0 ~ /^#/ { next }
-      NF == 0 { next }
-      {
-        if ($2 == target) {
-          count++
-          if (NF != 2 || length($1) != 64 || $1 !~ /^[0-9a-fA-F]+$/) {
-            invalid = 1
-          }
-        } else {
-          for (i = 1; i <= NF; i++) {
-            if ($i == target) malformed_pos = 1
-          }
-        }
-      }
-      END {
-        if (count == 1 && !invalid && !malformed_pos) exit 0
-        exit 1
-      }
-    ' "$m_file"
+    _a2_extract_global_hash "$m_file" "${out}.tar.zst" >/dev/null
   }
 
   # ==================== FLUXO PRINCIPAL ====================
@@ -1617,7 +1570,7 @@ archivepar2 () {
         read -r -p "Continue without valid BLAKE3 validation? [y/N]: " response </dev/tty
         if [[ "$response" =~ ^[yY](es)?$ ]]; then
           if _a2_check_content_integrity; then
-            _a2_print_log "[RESUME] Existing archive is healthy! Skipping compression stage."
+            _a2_print_log "[RESUME] Existing parts are healthy! Skipping compression stage."
             run_compression=0
           fi
         fi
