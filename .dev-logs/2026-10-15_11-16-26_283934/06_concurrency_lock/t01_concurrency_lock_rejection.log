@@ -1,3 +1,0 @@
-=== 06_concurrency_lock / t01_concurrency_lock_rejection ===
-TMPDIR: /tmp/a2test_t01_concurrency_lock_rejection_1lX78I
-ASSERT FAIL: O archivepar2 deve rejeitar execução concorrente se o lock existir (both='0')

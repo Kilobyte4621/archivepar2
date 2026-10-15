@@ -1,3 +1,0 @@
-=== 07_scriptignore_and_flags / t01_fast_mode_execution ===
-TMPDIR: /tmp/a2test_t01_fast_mode_execution_LHvBsT
-ASSERT FAIL: A execução com a flag --FAST deve suceder com código 0 (got='1' want='0')

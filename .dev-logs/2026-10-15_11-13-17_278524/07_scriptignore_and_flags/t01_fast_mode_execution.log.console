@@ -1,2 +1,0 @@
-ERROR: invalid argument: /tmp/a2test_t01_fast_mode_execution_WiPM2N/fast_source
-ASSERT FAIL: A execução com a flag --FAST deve suceder com código 0 (got='1' want='0')
