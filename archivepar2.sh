@@ -1,7 +1,6 @@
-# Version Details: v0.17-rc1.0.2
-# Change (from v0.17-rc1.0.1):
-# Reuse of _a2_init_fail: In argument errors and --keep, we exchange repeated pipefail restore lines for a clean call to _a2_init_fail.
-# Compression of the allocation: The temporary files are now created sequentially and cleanly, grouping the cleaning of previous files directly on the keys ||.
+# Version Details: v0.17
+# Change (from v0.17-rc1.0.3):
+# Version bump.
 
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
