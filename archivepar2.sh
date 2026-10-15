@@ -697,6 +697,7 @@ archivepar2 () {
 
     local f base
     local removed=0
+    local prune_failed=0
     for f in "${existing[@]}"; do
       [[ -e "$f" ]] || continue
       base=$(basename "$f")
@@ -705,12 +706,15 @@ archivepar2 () {
           (( ++removed ))
           _a2_print_log "[PRUNE] Removed obsolete part: $base"
         else
-          _a2_print_log "[PRUNE] WARN: could not remove obsolete part: $base"
+          _a2_print_log "[PRUNE] ERROR: could not remove obsolete part: $base"
+          prune_failed=1
         fi
       fi
     done
 
     (( removed > 0 )) && _a2_print_log "[PRUNE] Removed $removed obsolete part(s)."
+    
+    (( prune_failed )) && return 1
     return 0
   }
 
