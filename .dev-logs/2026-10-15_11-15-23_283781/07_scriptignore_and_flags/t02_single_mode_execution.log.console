@@ -1,0 +1,2 @@
+ERROR: invalid argument: /tmp/a2test_t02_single_mode_execution_2PBMzB/single_source
+ASSERT FAIL: A execução com a flag --SINGLE deve suceder com código 0 (got='1' want='0')

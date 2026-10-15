@@ -1,0 +1,9 @@
+ERROR: invalid argument: 10
+ERROR: invalid argument: 10
+ERROR: invalid argument: 10
+ASSERT FAIL: O link current deve existir (path='/tmp/a2test_t01_versioned_current_and_extract_CIwXUK/mydata-bak/current')
+ERROR: backup folder not found
+ASSERT FAIL: Restorepar2 verify deve suceder no layout versionado (got='1' want='0')
+ERROR: backup folder not found
+ASSERT FAIL: Restorepar2 extract deve suceder (got='1' want='0')
+ASSERT FAIL: O diretório extraído deve existir (got='1' want='0')

@@ -1,0 +1,6 @@
+=== 04_restorepar2_comprehensive / t01_versioned_current_and_extract ===
+TMPDIR: /tmp/a2test_t01_versioned_current_and_extract_qlZA8W
+ASSERT FAIL: O link current deve existir[cite: (path='/tmp/a2test_t01_versioned_current_and_extract_qlZA8W/mydata-bak/current')
+ASSERT FAIL: Restorepar2 verify deve suceder no layout versionado[cite: (got='1' want='0')
+ASSERT FAIL: Restorepar2 extract deve suceder[cite: (got='1' want='0')
+ASSERT FAIL: O diretório extraído padrão deve existir[cite: (path='/tmp/a2test_t01_versioned_current_and_extract_qlZA8W/mydata-restored')

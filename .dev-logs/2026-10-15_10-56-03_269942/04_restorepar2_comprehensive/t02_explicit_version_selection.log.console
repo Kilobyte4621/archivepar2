@@ -1,0 +1,10 @@
+ERROR: invalid argument: 10
+ERROR: invalid argument: 10
+ERROR: invalid argument: 10
+find: ‘/tmp/a2test_t02_explicit_version_selection_hvV1ht/mydata_v-bak’: No such file or directory
+basename: missing operand
+Try 'basename --help' for more information.
+ERROR: backup folder not found
+ASSERT FAIL: Extração de versão específica deve suceder[cite: (got='1' want='0')
+ERROR: --version requires a value
+ASSERT FAIL: Verify com --version explícita deve suceder[cite: (got='1' want='0')

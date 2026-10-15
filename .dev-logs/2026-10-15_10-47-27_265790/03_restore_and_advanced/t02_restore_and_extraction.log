@@ -1,0 +1,3 @@
+=== 03_restore_and_advanced / t02_restore_and_extraction ===
+TMPDIR: /tmp/a2test_t02_restore_and_extraction_6Mo2sE
+ASSERT FAIL: A extração pelo restorepar2 deve suceder (got='127' want='0')

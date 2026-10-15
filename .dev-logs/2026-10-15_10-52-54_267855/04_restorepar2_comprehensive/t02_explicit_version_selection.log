@@ -1,0 +1,4 @@
+=== 04_restorepar2_comprehensive / t02_explicit_version_selection ===
+TMPDIR: /tmp/a2test_t02_explicit_version_selection_8NRkrs
+ASSERT FAIL: Extração de versão específica deve suceder (got='1' want='0')
+ASSERT FAIL: Verify com --version separada deve suceder (got='1' want='0')
