@@ -1,7 +1,6 @@
-# Version Details: v0.17-rc1.0.2
-# Change (from v0.17-rc1.0.1):
-# Reuse of _a2_init_fail: In argument errors and --keep, we exchange repeated pipefail restore lines for a clean call to _a2_init_fail.
-# Compression of the allocation: The temporary files are now created sequentially and cleanly, grouping the cleaning of previous files directly on the keys ||.
+# Version Details: v0.17
+# Change (from v0.17-rc1.0.3):
+# Version bump.
 
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
@@ -697,6 +696,7 @@ archivepar2 () {
 
     local f base
     local removed=0
+    local prune_failed=0
     for f in "${existing[@]}"; do
       [[ -e "$f" ]] || continue
       base=$(basename "$f")
@@ -705,12 +705,15 @@ archivepar2 () {
           (( ++removed ))
           _a2_print_log "[PRUNE] Removed obsolete part: $base"
         else
-          _a2_print_log "[PRUNE] WARN: could not remove obsolete part: $base"
+          _a2_print_log "[PRUNE] ERROR: could not remove obsolete part: $base"
+          prune_failed=1
         fi
       fi
     done
 
     (( removed > 0 )) && _a2_print_log "[PRUNE] Removed $removed obsolete part(s)."
+    
+    (( prune_failed )) && return 1
     return 0
   }
 
