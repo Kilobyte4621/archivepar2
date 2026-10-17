@@ -1,6 +1,6 @@
-# Version Details: v0.17
-# Change (from v0.17-rc1.0.3):
-# Version bump.
+# Version Details: v0.17.0.1
+# Change (from v0.17):
+# 1. Improved BLAKE3 hash logging. v0.17.1 will be the final release of this feature. 
 
 archivepar2 () {
   if [[ $# -eq 0 ]]; then
@@ -17,6 +17,8 @@ archivepar2 () {
   local t_start t_end t_total
   local t_compress_dur="0s" t_check_dur="0s" t_par2_dur="0s"
   local compress_status="SKIPPED" check_status="SKIPPED" par2_status="PENDING"
+  local t_blake3_dur="0s" t_structure_dur="0s"
+  local blake3_status="SKIPPED" structure_status="SKIPPED"
   local zstd_golden_line=""
 
   local keep_versions=3
@@ -296,7 +298,7 @@ archivepar2 () {
   echo "Output Base Name: $out" >> "$logfile"
   echo "Target Directory: $backup_dir" >> "$logfile"
   echo "Arguments Used  : Single Mode=$single_mode | Fast Mode=$fast_mode | Max Size=$maxsize | Keep=$keep_versions | No-Migrate=$no_migrate" >> "$logfile"
-  echo "Version         : v0.17-rc1.0.1" >> "$logfile"
+  echo "Version         : v0.17.0.1" >> "$logfile"
   echo "--------------------------------------------------" >> "$logfile"
 
   _a2_print_log() {
@@ -1179,8 +1181,31 @@ archivepar2 () {
     local active_manifest="$active_dir/${out}.blake3"
     local stored
 
+    local structure_start structure_end structure_rc
+    structure_start=$(date +%s)
+
     stored=$(_a2_extract_global_hash "$active_manifest" "${out}.tar.zst")
-    local v_status=$?
+    
+    structure_rc=$?
+    structure_end=$(date +%s)
+    t_structure_dur=$(_a2_format_duration $((structure_end - structure_start)))
+
+    case $structure_rc in
+      0)
+        structure_status="VALID"
+        ;;
+      10)
+        structure_status="MISSING"
+        ;;
+      11)
+        structure_status="INVALID"
+        ;;
+      *)
+        structure_status="ERROR"
+        ;;
+    esac
+
+    local v_status=$structure_rc
 
     case $v_status in
       0)  : ;;
@@ -1190,38 +1215,89 @@ archivepar2 () {
       *)  _a2_print_log "ERROR: Failed to read or parse manifest file due to I/O or syntax error."
           return 4 ;;
     esac
+
+
+    local blake3_start blake3_end
+    blake3_start=$(date +%s)
 
     : > "$resume_out_file"
     if ! _a2_launch_job pid_resume pgid_resume bash -c '
       set -o pipefail
       b3sum "$1" | awk '\''{print $1}'\'' > "$2"
     ' _ "$active_dir/${out}.tar.zst" "$resume_out_file"; then
+      blake3_status="ERROR"
       _a2_print_log "ERROR: Failed to launch resume hash job."
       return 4
     fi
+
     local resume_wait_status=0
     if ! _a2_reap_job pid_resume pgid_resume resume_wait_status; then
+      blake3_status="ERROR"
       _a2_print_log "ERROR: Could not reliably reap resume hash job."
       return 4
     fi
+
+    blake3_end=$(date +%s)
+    t_blake3_dur=$(_a2_format_duration $((blake3_end - blake3_start)))
+
     if (( resume_wait_status != 0 )) || ! [[ -f "$resume_out_file" ]]; then
+      blake3_status="ERROR"
       _a2_print_log "ERROR: Failed to compute hash for existing archive during resume."
       return 4
     fi
+
     local current
     current=$(< "$resume_out_file")
-    [[ -n "$current" ]] || return 4
+    if [[ -z "$current" ]]; then
+      blake3_status="FAILED"
+      return 4
+    fi
+
     _a2_print_log "[BLAKE3] Stored Global : $stored"
     _a2_print_log "[BLAKE3] Current Stream: $current"
-    [[ "$stored" == "$current" ]]
+
+    if [[ "$stored" == "$current" ]]; then
+      blake3_status="SUCCESS"
+      local blake3_rc=0
+    else
+      blake3_status="FAILED"
+      local blake3_rc=1
+    fi
+
+    _a2_print_log "[BLAKE3] Verification: $blake3_status"
+    return "$blake3_rc"
+
   }
 
   _a2_verify_manifest_split() {
     local active_manifest="$active_dir/${out}.blake3"
     local stored
 
+    local structure_start structure_end structure_rc
+    structure_start=$(date +%s)
+
     stored=$(_a2_extract_global_hash "$active_manifest" "${out}.tar.zst")
-    local v_status=$?
+    
+    structure_rc=$?
+    structure_end=$(date +%s)
+    t_structure_dur=$(_a2_format_duration $((structure_end - structure_start)))
+
+    case $structure_rc in
+      0)
+        structure_status="VALID"
+        ;;
+      10)
+        structure_status="MISSING"
+        ;;
+      11)
+        structure_status="INVALID"
+        ;;
+      *)
+        structure_status="ERROR"
+        ;;
+    esac
+
+    local v_status=$structure_rc
 
     case $v_status in
       0)  : ;;
@@ -1232,14 +1308,22 @@ archivepar2 () {
           return 4 ;;
     esac
 
+    local blake3_start blake3_end
+    blake3_start=$(date +%s)
+
     : > "$resume_out_file"
+
     if command -v pv >/dev/null 2>&1; then
       if ! _a2_launch_job pid_resume pgid_resume bash -c '
         set -o pipefail
         out_file="${@: -1}"
         parts_list=("${@:1:$#-1}")
-        cat -- "${parts_list[@]}" | pv -N "Validating Split Files" -p -t -e -r -b | b3sum | awk '\''{print $1}'\'' > "$out_file"
+        cat -- "${parts_list[@]}" |
+          pv -N "Validating Split Files" -p -t -e -r -b |
+          b3sum |
+          awk '\''{print $1}'\'' > "$out_file"
       ' _ "${parts[@]/#/$active_dir/}" "$resume_out_file"; then
+        blake3_status="ERROR"
         _a2_print_log "ERROR: Failed to launch split resume hash job."
         return 4
       fi
@@ -1248,27 +1332,53 @@ archivepar2 () {
         set -o pipefail
         out_file="${@: -1}"
         parts_list=("${@:1:$#-1}")
-        cat -- "${parts_list[@]}" | b3sum | awk '\''{print $1}'\'' > "$out_file"
+        cat -- "${parts_list[@]}" |
+          b3sum |
+          awk '\''{print $1}'\'' > "$out_file"
       ' _ "${parts[@]/#/$active_dir/}" "$resume_out_file"; then
+        blake3_status="ERROR"
         _a2_print_log "ERROR: Failed to launch split resume hash job."
         return 4
       fi
     fi
+
     local resume_wait_status=0
     if ! _a2_reap_job pid_resume pgid_resume resume_wait_status; then
+      blake3_status="ERROR"
       _a2_print_log "ERROR: Could not reliably reap split resume hash job."
       return 4
     fi
+
+    blake3_end=$(date +%s)
+    t_blake3_dur=$(_a2_format_duration "$((blake3_end - blake3_start))")
+
+   
     if (( resume_wait_status != 0 )) || ! [[ -f "$resume_out_file" ]]; then
+      blake3_status="ERROR"
       _a2_print_log "ERROR: Failed to read/compute hash of split parts during resume."
       return 4
     fi
+
     local current
     current=$(< "$resume_out_file")
-    [[ -n "$current" ]] || return 4
+    if [[ -z "$current" ]]; then
+      blake3_status="FAILED"
+      return 4
+    fi
+
     _a2_print_log "[BLAKE3] Stored Global : $stored"
     _a2_print_log "[BLAKE3] Current Stream: $current"
-    [[ "$stored" == "$current" ]]
+
+    if [[ "$stored" == "$current" ]]; then
+      blake3_status="SUCCESS"
+      _a2_print_log "[BLAKE3] Verification: SUCCESS"
+      return 0
+    else
+      blake3_status="FAILED"
+      _a2_print_log "[BLAKE3] Verification: FAILED"
+      return 1
+    fi
+
   }
 
   _a2_validate_global_manifest() {
@@ -1295,8 +1405,13 @@ archivepar2 () {
 
     if [[ ${#parts[@]} -gt 0 ]]; then
       _a2_print_log "[RESUME] Found existing split parts. Testing their integrity directly..."
+
       _a2_verify_manifest_split
       local v_status=$?
+
+      _a2_print_log "[MANIFEST] Structure: $structure_status (${t_structure_dur})"
+      _a2_print_log "[BLAKE3] Hash verification: $blake3_status (${t_blake3_dur})"
+
       if (( v_status == 0 )); then
         _a2_print_log "[BLAKE3] Manifest OK"
         if _a2_check_content_integrity; then
@@ -1559,8 +1674,13 @@ archivepar2 () {
     local active_single="$active_dir/${out}.tar.zst"
     if [[ -f "$active_single" ]]; then
       _a2_print_log "[RESUME] Found existing target archive. Testing its integrity directly..."
+
       _a2_verify_manifest_single
       local v_status=$?
+
+      _a2_print_log "[MANIFEST] Structure: $structure_status (${t_structure_dur})"
+      _a2_print_log "[BLAKE3] Hash verification: $blake3_status (${t_blake3_dur})"
+
       if (( v_status == 0 )); then
         _a2_print_log "[BLAKE3] Manifest OK"
         if _a2_check_content_integrity; then
@@ -1781,6 +1901,8 @@ archivepar2 () {
     echo "                PERFORMANCE SUMMARY"
     echo "=================================================="
     echo "• [COMPRESSION] : $t_compress_dur | Status: $compress_status"
+    echo "• [BLAKE3 HASH]       : $t_blake3_dur | Status: $blake3_status"
+    echo "• [MANIFEST STRUCTURE]: $t_structure_dur | Status: $structure_status"
     echo "• [TAR CHECK]   : $t_check_dur | Status: $check_status"
     echo "• [PAR2 CREATE] : $t_par2_dur | Status: $par2_status"
     echo "--------------------------------------------------"

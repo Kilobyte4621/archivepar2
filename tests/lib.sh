@@ -158,6 +158,11 @@ _t_mkfile() {
   printf '%s' "$content" > "$path"
 }
 
+# _t_mktemp -> cria um arquivo temporário em $_T_TEST_TMPDIR e ecoa o caminho
+_t_mktemp() {
+  mktemp "$_T_TEST_TMPDIR/test_output_XXXXXX"
+}
+
 # _t_random_file <path> <size_bytes>
 _t_random_file() {
   local path="$1" size="$2"
